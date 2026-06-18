@@ -106,9 +106,10 @@ bot_state = {
     "account_cash": 0.0, "account_equity": 0.0, "account_buying_power": 0.0,
     "active_cooldowns": {},
     "market_regime": "UNKNOWN",
+    "symbol_regimes": {s.replace("/",""): "UNKNOWN" for s in ["BTC/USD","ETH/USD","SOL/USD","XRP/USD","DOGE/USD"]},
     "daily_paused": False,
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
-    "version": "Combined-1.0"
+    "version": "Combined-1.1"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────────────
@@ -300,6 +301,7 @@ def calc_atr(bars, period=14):
 
 # ── Market helpers ─────────────────────────────────────────────────────────────
 def check_market_regime():
+    """Global BTC regime - kept for reference"""
     try:
         bars = get_bars("BTC/USD", "1Day", 210)
         if len(bars) < 200:
@@ -309,10 +311,27 @@ def check_market_regime():
         if not ema200:
             return "UNKNOWN"
         regime = "BULL" if closes[-1] > ema200[-1] else "BEAR"
-        log.info(f"Regime: {regime} | BTC={closes[-1]:.0f} | 200EMA={ema200[-1]:.0f}")
+        log.info(f"Global regime: {regime} | BTC={closes[-1]:.0f} | 200EMA={ema200[-1]:.0f}")
         return regime
     except Exception as e:
         log.error(f"Regime check error: {e}")
+        return "UNKNOWN"
+
+def check_symbol_regime(symbol):
+    """Per-symbol 200-day EMA regime - Option 2 fix"""
+    try:
+        bars = get_bars(symbol, "1Day", 210)
+        if len(bars) < 200:
+            return "UNKNOWN"
+        closes = [b["close"] for b in bars]
+        ema200 = calc_ema(closes, 200)
+        if not ema200:
+            return "UNKNOWN"
+        regime = "BULL" if closes[-1] > ema200[-1] else "BEAR"
+        log.info(f"Regime {symbol}: {regime} | price={closes[-1]:.2f} | 200EMA={ema200[-1]:.2f}")
+        return regime
+    except Exception as e:
+        log.error(f"Symbol regime check error {symbol}: {e}")
         return "UNKNOWN"
 
 def is_in_time_window(cfg):
@@ -791,12 +810,16 @@ def try_entry(symbol, strategy, sig, regime, now):
     if not ok:
         return
 
+    # Per-symbol regime (Option 2) — each coin checks its own 200 EMA
+    sym_key = symbol.replace("/", "")
+    sym_regime = bot_state["symbol_regimes"].get(sym_key, "UNKNOWN")
+
     # Strategy-specific entry gates
     if strategy == "EMA":
         cfg = EMA_CONFIG
         if sig.get("buy_score", 0) < cfg["min_score"]:
             return
-        if not sig.get("regime_ok") and regime == "BEAR":
+        if sym_regime == "BEAR":
             return
         if not is_in_time_window(cfg):
             return
@@ -807,7 +830,7 @@ def try_entry(symbol, strategy, sig, regime, now):
             return
         if not sig.get("mss_detected"):
             return
-        if regime == "BEAR":
+        if sym_regime == "BEAR":
             return
         if not is_in_time_window(cfg):
             return
@@ -815,14 +838,14 @@ def try_entry(symbol, strategy, sig, regime, now):
     elif strategy == "VPA":
         if sig.get("buy_score", 0) < VPA_CONFIG["min_score"]:
             return
-        if regime == "BEAR":
+        if sym_regime == "BEAR":
             return
 
     elif strategy == "Breakout":
         if not sig.get("buy_signal"):
             return
-        # Momentum override bypasses bear filter
-        if regime == "BEAR" and not sig.get("momentum_override"):
+        # Option 3: Momentum override always bypasses bear filter
+        if sym_regime == "BEAR" and not sig.get("momentum_override"):
             return
 
     # Place order
@@ -895,6 +918,9 @@ def trading_loop():
             # Regime check every 30 minutes
             if not regime_check_time or (now - regime_check_time).total_seconds() > 1800:
                 bot_state["market_regime"] = check_market_regime()
+                # Per-symbol regime check (Option 2)
+                for sym in SYMBOLS:
+                    bot_state["symbol_regimes"][sym.replace("/","")] = check_symbol_regime(sym)
                 regime_check_time = now
 
             regime = bot_state["market_regime"]
