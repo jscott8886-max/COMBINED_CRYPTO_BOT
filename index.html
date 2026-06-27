@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ScalpAI — Combined Crypto</title>
+<title>ScalpAI — Combined Crypto v1.1</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/lightweight-charts/3.8.0/lightweight-charts.standalone.production.js"></script>
 <style>
   :root {
@@ -464,7 +464,7 @@
     <div class="logo-mark">S</div>
     <div>
       <div class="logo-text">SCALPAI</div>
-      <div class="logo-sub">COMBINED CRYPTO</div>
+      <div class="logo-sub">COMBINED CRYPTO · v1.1</div>
     </div>
   </div>
   <div class="header-stats">
@@ -556,8 +556,20 @@ function updateHeader() {
   document.getElementById('hWinRate').textContent = wr + '%';
 
   const rb = document.getElementById('regimeBadge');
-  rb.textContent = regime + ' MARKET';
+  rb.textContent = 'BTC ' + regime;
   rb.className = 'regime-badge ' + (regime === 'BULL' ? 'bull' : regime === 'BEAR' ? 'bear' : 'unknown');
+
+  // Per-symbol regimes (v1.1)
+  const symRegimes = LIVE.symbol_regimes || {};
+  const symColors = { 'BULL': '#22c55e', 'BEAR': '#ef4444', 'UNKNOWN': '#8a8fa8' };
+  const symEl = document.getElementById('symbolRegimes');
+  if (symEl && Object.keys(symRegimes).length > 0) {
+    symEl.innerHTML = Object.entries(symRegimes).map(([sym, r]) =>
+      `<span style="font-size:9px;padding:2px 6px;border-radius:3px;font-weight:700;
+        background:${symColors[r]}22;color:${symColors[r]};
+        border:1px solid ${symColors[r]}44">${sym.replace('USD','')}<br>${r}</span>`
+    ).join('');
+  }
 
   const kb = document.getElementById('killBtn');
   kb.className = 'kill-btn' + (LIVE.killed ? ' active' : '');
@@ -703,8 +715,24 @@ function renderHome() {
       <div class="stat-card">
         <div class="stat-label">Open Positions</div>
         <div class="stat-value gold">${Object.keys(pos).length} / 4</div>
-        <div class="stat-sub">Regime: ${LIVE.market_regime || '—'}</div>
+        <div class="stat-sub">Global: BTC ${LIVE.market_regime || '—'}</div>
       </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:8px;margin-bottom:16px">
+      ${(() => {
+        const sr = LIVE.symbol_regimes || {};
+        const symMap = { BTCUSD: 'BTC', ETHUSD: 'ETH', SOLUSD: 'SOL', XRPUSD: 'XRP', DOGEUSD: 'DOGE' };
+        return Object.entries(sr).map(([sym, r]) => {
+          const name = symMap[sym] || sym;
+          const color = r === 'BULL' ? 'var(--green)' : r === 'BEAR' ? 'var(--red)' : 'var(--text-dim)';
+          const icon = r === 'BULL' ? '🐂' : r === 'BEAR' ? '🐻' : '—';
+          return `<div class="stat-card" style="padding:10px 14px">
+            <div class="stat-label">${name}</div>
+            <div style="font-size:18px;font-weight:700;color:${color}">${icon} ${r}</div>
+          </div>`;
+        }).join('');
+      })()}
     </div>
 
     <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px">
