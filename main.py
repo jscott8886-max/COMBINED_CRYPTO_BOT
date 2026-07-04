@@ -21,7 +21,7 @@ PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
 
 SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
            "AVAX/USD", "LINK/USD", "LTC/USD", "ADA/USD", "UNI/USD"]
-STRATEGIES = ["EMA", "MSS", "VPA", "Breakout"]
+STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap"]
 
 EMA_CONFIG = {
     "name": "EMA", "ema_fast": 9, "ema_slow": 21, "ema_trend": 50,
@@ -41,7 +41,8 @@ MSS_CONFIG = {
 VPA_CONFIG = {
     "name": "VPA", "volume_spike_mult": 2.0, "volume_avg_period": 20,
     "min_close_ratio": 0.6, "effort_result_ratio": 0.02,
-    "min_score": 3, "min_score_confirmed": 2,
+    "min_score": 3, "min_score_confirmed": 3,  # FIX: raised 2->3, weak confirms killed win rate
+    "bear_score_cap": 4,  # FIX: cap score at 4 in bear regime — score 5 = distribution not accumulation
     "time_filter": False, "bear_filter": False,
 }
 BREAKOUT_CONFIG = {
@@ -53,10 +54,23 @@ BREAKOUT_CONFIG = {
     "time_filter": False, "bear_filter": False,
 }
 
+GAP_CONFIG = {
+    "name": "WeekendGap", "min_gap_pct": 1.0, "max_gap_pct": 8.0,
+    "volume_confirm_mult": 1.3, "min_score": 4,
+}
+
+# Session open windows (UTC) for momentum boost — not fake gaps, real volume windows
+SESSION_WINDOWS_UTC = [
+    (0, 0.5),    # Tokyo open ~00:00 UTC (8PM ET)
+    (7, 7.5),    # London open ~07:00 UTC (3AM ET)
+    (13.5, 14),  # NY open ~13:30 UTC (9:30AM ET)
+]
+
 RISK = {
     "position_size": 0.12, "stop_loss_pct": 0.75, "take_profit_pct": 1.5,
     "max_positions_per_strategy": 2, "max_total_positions": 6,
     "cooldown_minutes": 10, "daily_loss_limit_pct": 5.0,
+    "time_exit_minutes": 30,  # FIX: close if not profitable after 30min
 }
 
 bot_state = {
@@ -73,7 +87,9 @@ bot_state = {
     "active_cooldowns": {}, "daily_paused": False,
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "pending_confirmation": {},
-    "version": "Combined-2.0"
+    "prev_week_closes": {},  # For weekend gap detection
+    "gap_fired_this_week": {},
+    "version": "Combined-3.0"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
@@ -91,6 +107,7 @@ def get_bars(symbol, timeframe="5Min", limit=50):
         from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
         client = get_data_client()
         tf_map = {"1Min": TimeFrame(1, TimeFrameUnit.Minute), "5Min": TimeFrame(5, TimeFrameUnit.Minute),
+                  "15Min": TimeFrame(15, TimeFrameUnit.Minute),
                   "1Hour": TimeFrame(1, TimeFrameUnit.Hour), "1Day": TimeFrame(1, TimeFrameUnit.Day)}
         tf = tf_map.get(timeframe, TimeFrame(5, TimeFrameUnit.Minute))
         end = datetime.now(timezone.utc)
@@ -256,10 +273,10 @@ def record_exit(symbol, strategy, pnl, win):
     if win: s["wins"] += 1
 
 # ── STRATEGIES ─────────────────────────────────────────────────────────
-def run_ema(symbol, regime):
+def run_ema(symbol, regime, tf="5Min"):
     cfg = EMA_CONFIG
     try:
-        bars_5m = get_bars(symbol, "5Min", 60); bars_1h = get_bars(symbol, "1Hour", 60)
+        bars_5m = get_bars(symbol, tf, 60); bars_1h = get_bars(symbol, "1Hour", 60)
         if len(bars_5m) < 30 or len(bars_1h) < 30: return {}
         closes = [b["close"] for b in bars_5m]; closes_1h = [b["close"] for b in bars_1h]
         volumes = [b["volume"] for b in bars_5m]; price = closes[-1]
@@ -278,10 +295,10 @@ def run_ema(symbol, regime):
         sk = symbol.replace("/","")
 
         if rsi > cfg["rsi_hard_gate"]:
-            bot_state["signals"][sk]["EMA"] = {"price": price, "rsi": round(rsi,1), "blocked": "RSI_HIGH", "buy_score": 0, "strategy": "EMA"}
+            bot_state["signals"][sk]["EMA" if tf=="5Min" else "EMA_15m"] = {"price": price, "rsi": round(rsi,1), "blocked": "RSI_HIGH", "buy_score": 0, "strategy": "EMA"}
             return bot_state["signals"][sk]["EMA"]
         if not atr_ok:
-            bot_state["signals"][sk]["EMA"] = {"price": price, "blocked": "ATR_LOW", "buy_score": 0, "strategy": "EMA"}
+            bot_state["signals"][sk]["EMA" if tf=="5Min" else "EMA_15m"] = {"price": price, "blocked": "ATR_LOW", "buy_score": 0, "strategy": "EMA"}
             return bot_state["signals"][sk]["EMA"]
 
         confirmed = check_confirmation(symbol, "EMA", bars_5m[-1])
@@ -294,20 +311,22 @@ def run_ema(symbol, regime):
         if bb_bw >= cfg["bb_min_bw"] and price < bb_low: score += 1
         if vol_ratio >= cfg["volume_bonus_mult"]: score += 1
 
-        if score >= cfg["min_score_confirmed"] and score < cfg["min_score"] and not confirmed:
+        if score >= cfg["min_score"]:
+            confirmed = True
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
             set_pending(symbol, "EMA", {"score": score})
 
         sig = {"price": price, "rsi": round(rsi,1), "rsi_rising": rsi_rising,
                "vol_ratio": round(vol_ratio,2), "buy_score": score, "confirmed": confirmed, "strategy": "EMA"}
-        bot_state["signals"][sk]["EMA"] = sig
+        bot_state["signals"][sk]["EMA" if tf=="5Min" else "EMA_15m"] = sig
         log.info(f"[EMA] {symbol} | price={price} RSI={round(rsi,1)} score={score} conf={confirmed}")
         return sig
     except Exception as e: log.error(f"[EMA] error {symbol}: {e}"); return {}
 
-def run_mss(symbol, regime):
+def run_mss(symbol, regime, tf="5Min"):
     cfg = MSS_CONFIG
     try:
-        bars_5m = get_bars(symbol, "5Min", 60); bars_1h = get_bars(symbol, "1Hour", 30)
+        bars_5m = get_bars(symbol, tf, 60); bars_1h = get_bars(symbol, "1Hour", 30)
         if len(bars_5m) < 20 or len(bars_1h) < 15: return {}
         closes = [b["close"] for b in bars_5m]; highs_1h = [b["high"] for b in bars_1h]
         lows_1h = [b["low"] for b in bars_1h]; lows_5m = [b["low"] for b in bars_5m]
@@ -326,7 +345,7 @@ def run_mss(symbol, regime):
             elif max(rh) < max(ph) and min(rl) < min(pl): trend_1h = "BEAR"
 
         if trend_1h != "BULL":
-            bot_state["signals"][sk]["MSS"] = {"price": price, "trend_1h": trend_1h, "buy_score": 0, "strategy": "MSS"}
+            bot_state["signals"][sk]["MSS" if tf=="5Min" else "MSS_15m"] = {"price": price, "trend_1h": trend_1h, "buy_score": 0, "strategy": "MSS"}
             return bot_state["signals"][sk]["MSS"]
 
         last_sig = bot_state["mss_last_signal_time"].get(symbol)
@@ -346,21 +365,23 @@ def run_mss(symbol, regime):
         elif rsi < cfg["rsi_soft_threshold"]: score += 1
         if vol_ratio >= cfg["volume_bonus_mult"]: score += 1
 
-        if score >= cfg["min_score_confirmed"] and score < cfg["min_score"] and not confirmed:
+        if score >= cfg["min_score"]:
+            confirmed = True
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
             set_pending(symbol, "MSS", {"score": score})
 
         sig = {"price": price, "trend_1h": trend_1h, "mss_detected": mss, "rsi": round(rsi,1),
                "rsi_rising": rsi_rising, "vol_ratio": round(vol_ratio,2),
                "buy_score": score, "confirmed": confirmed, "strategy": "MSS"}
-        bot_state["signals"][sk]["MSS"] = sig
+        bot_state["signals"][sk]["MSS" if tf=="5Min" else "MSS_15m"] = sig
         log.info(f"[MSS] {symbol} | trend={trend_1h} MSS={mss} score={score} conf={confirmed}")
         return sig
     except Exception as e: log.error(f"[MSS] error {symbol}: {e}"); return {}
 
-def run_vpa(symbol, regime):
+def run_vpa(symbol, regime, tf="5Min"):
     cfg = VPA_CONFIG
     try:
-        bars = get_bars(symbol, "5Min", 40)
+        bars = get_bars(symbol, tf, 40)
         if len(bars) < 25: return {}
         volumes = [b["volume"] for b in bars]; closes = [b["close"] for b in bars]
         opens = [b["open"] for b in bars]; highs = [b["high"] for b in bars]; lows = [b["low"] for b in bars]
@@ -385,20 +406,92 @@ def run_vpa(symbol, regime):
         ema20 = calc_ema(closes, 20)
         if ema20 and price > ema20[-1]: score += 1
 
-        if score >= cfg["min_score_confirmed"] and score < cfg["min_score"] and not confirmed:
+        # FIX: score 5 in bear regime = institutional distribution, not accumulation — cap it
+        raw_score = score
+        if regime == "BEAR" and score > cfg["bear_score_cap"]:
+            score = cfg["bear_score_cap"]
+            signals_detected.append("BEAR_CAPPED")
+
+        # FIX: score 4+ enters immediately, skip confirmation requirement entirely
+        if score >= cfg["min_score"]:
+            confirmed = True  # treat as confirmed — high score doesn't need candle confirmation
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
             set_pending(symbol, "VPA", {"score": score})
 
         sig = {"price": price, "vol_ratio": round(vol_ratio,2), "close_ratio": round(close_ratio,2),
-               "buy_score": score, "signals": signals_detected, "confirmed": confirmed, "strategy": "VPA"}
-        bot_state["signals"][sk]["VPA"] = sig
+               "buy_score": score, "raw_score": raw_score, "signals": signals_detected, "confirmed": confirmed, "strategy": "VPA"}
+        bot_state["signals"][sk]["VPA" if tf=="5Min" else "VPA_15m"] = sig
         log.info(f"[VPA] {symbol} | vol={round(vol_ratio,2)}x score={score} sigs={signals_detected} conf={confirmed}")
         return sig
     except Exception as e: log.error(f"[VPA] error {symbol}: {e}"); return {}
 
-def run_breakout(symbol, regime):
+def is_session_window():
+    """Returns True if within 30min of Tokyo/London/NY open — real volume windows"""
+    now = datetime.now(timezone.utc)
+    h = now.hour + now.minute/60
+    for start, end in SESSION_WINDOWS_UTC:
+        if start <= h < end:
+            return True
+    return False
+
+def is_weekend_gap_window():
+    """Sunday 00:00-01:00 UTC — right after the weekly low-liquidity weekend period,
+    comparing Friday 21:00 UTC close to current price"""
+    now = datetime.now(timezone.utc)
+    return now.weekday() == 6 and now.hour < 1  # Sunday, first hour
+
+def run_weekend_gap(symbol, regime):
+    """5th strategy — crypto's equivalent of ETF's Gap detector.
+    Compares Friday 9PM UTC (5PM ET, when TradFi closes) price to Sunday open price."""
+    cfg = GAP_CONFIG
+    try:
+        if not is_weekend_gap_window():
+            return {}
+        sk = symbol.replace("/","")
+        week_key = datetime.now(timezone.utc).strftime("%Y-W%U")
+        if bot_state["gap_fired_this_week"].get(sk) == week_key:
+            return {}
+
+        bars = get_bars(symbol, "1Hour", 72)  # 3 days back to find Friday close
+        if len(bars) < 10: return {}
+
+        # Find the bar closest to Friday 21:00 UTC
+        friday_close = None
+        for b in bars:
+            try:
+                bt = datetime.fromisoformat(b["time"].replace("Z","+00:00"))
+                if bt.weekday() == 4 and bt.hour >= 20:
+                    friday_close = b["close"]
+            except: continue
+        if not friday_close:
+            friday_close = bars[-24]["close"] if len(bars) >= 24 else bars[0]["close"]
+
+        current_price = bars[-1]["close"]
+        volumes = [b["volume"] for b in bars[-24:]]
+        avg_vol = sum(volumes) / len(volumes) if volumes else 1
+        curr_vol = bars[-1]["volume"]
+        vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 0
+
+        gap_pct = (current_price - friday_close) / friday_close * 100
+        is_gap_up = cfg["min_gap_pct"] <= gap_pct <= cfg["max_gap_pct"]
+        vol_ok = vol_ratio >= cfg["volume_confirm_mult"]
+
+        score = 5 if (is_gap_up and vol_ok) else 0
+        sig = {"price": current_price, "friday_close": round(friday_close,4),
+               "gap_pct": round(gap_pct,2), "vol_ratio": round(vol_ratio,2),
+               "is_gap_up": is_gap_up, "buy_score": score, "confirmed": True,
+               "strategy": "Gap"}
+        bot_state["signals"][sk]["Gap"] = sig
+        if score > 0:
+            log.info(f"[Gap] {symbol} | weekend gap {round(gap_pct,2)}% vol={round(vol_ratio,1)}x SCORE={score}")
+        return sig
+    except Exception as e:
+        log.error(f"[Gap] error {symbol}: {e}"); return {}
+
+def run_breakout(symbol, regime, tf="5Min"):
     cfg = BREAKOUT_CONFIG
     try:
-        bars = get_bars(symbol, "5Min", 40)
+        bars = get_bars(symbol, tf, 40)
         if len(bars) < 15: return {}
         closes = [b["close"] for b in bars]; highs = [b["high"] for b in bars]
         lows = [b["low"] for b in bars]; volumes = [b["volume"] for b in bars]
@@ -410,8 +503,10 @@ def run_breakout(symbol, regime):
         candle_pct = abs(curr_close - curr_open) / curr_open * 100 if curr_open > 0 else 0
         sk = symbol.replace("/","")
 
-        # Momentum override — lowered to 1.5%
-        momentum_override = (candle_pct >= cfg["momentum_override_pct"] and
+        # Momentum override — lowered to 1.5%, further reduced during session opens (real volume windows)
+        session_active = is_session_window()
+        momentum_threshold = cfg["momentum_override_pct"] * 0.7 if session_active else cfg["momentum_override_pct"]
+        momentum_override = (candle_pct >= momentum_threshold and
                             vol_ratio >= cfg["momentum_override_volume"] and curr_close > curr_open)
 
         lookback = cfg["consolidation_candles"]
@@ -440,8 +535,9 @@ def run_breakout(symbol, regime):
         sig = {"price": price, "vol_ratio": round(vol_ratio,2), "candle_pct": round(candle_pct,2),
                "consol_pct": round(c_range_pct,2), "is_breakout": is_breakout,
                "momentum_override": momentum_override, "buy_signal": buy_signal,
-               "buy_score": score, "confirmed": confirmed, "strategy": "Breakout"}
-        bot_state["signals"][sk]["Breakout"] = sig
+               "session_active": session_active, "buy_score": score,
+               "confirmed": confirmed, "strategy": "Breakout"}
+        bot_state["signals"][sk]["Breakout" if tf=="5Min" else "Breakout_15m"] = sig
         log.info(f"[Breakout] {symbol} | vol={round(vol_ratio,1)}x candle={round(candle_pct,2)}% breakout={is_breakout} momentum={momentum_override}")
         return sig
     except Exception as e: log.error(f"[Breakout] error {symbol}: {e}"); return {}
@@ -453,9 +549,19 @@ def check_exits(symbol, price, now):
     entry = pos["entry"]; qty = pos["qty"]; strategy = pos.get("strategy", "UNKNOWN")
     pct = (price - entry) / entry * 100
     should_exit = False; reason = ""
+
+    # FIX: 30-minute time exit — cut losers early, they rarely recover (data confirmed)
+    open_time = pos.get("open_time")
+    minutes_open = 0
+    if open_time:
+        minutes_open = (now - datetime.fromisoformat(open_time)).total_seconds() / 60
+
     if pct >= RISK["take_profit_pct"]: should_exit = True; reason = f"Take profit (+{round(pct,2)}%)"
     elif pct <= -RISK["stop_loss_pct"]:
         should_exit = True; reason = f"Stop loss ({round(pct,2)}%)"
+        bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
+    elif minutes_open >= RISK["time_exit_minutes"] and pct < 0:
+        should_exit = True; reason = f"30min time exit ({round(pct,2)}%)"
         bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
     if should_exit:
         if close_position_alpaca(symbol):
@@ -514,10 +620,11 @@ def trading_loop():
         log.warning("No Alpaca credentials"); return
 
     add_diary("SYSTEM",
-        "Combined Crypto v2.0 started | 4 Strategies | 10 Coins | "
-        "Confirmation candles | 2 pos/strategy | 10min cooldown | "
-        "VPA+Breakout no bear filter | Momentum override 1.5%", "system")
-    log.info("Combined Crypto Bot v2.0 started")
+        "Combined Crypto v3.0 started | 5 Strategies (+WeekendGap) | 10 Coins | "
+        "VPA confirmed 2->3 | Bear score cap 4 | 30min time exit | "
+        "Score 4+ skips confirmation | Session momentum boost | "
+        "VPA+Breakout no bear filter", "system")
+    log.info("Combined Crypto Bot v3.0 started")
 
     regime_check_time = None; daily_reset_date = None
     while True:
@@ -557,11 +664,20 @@ def trading_loop():
                 check_exits(symbol, price, now)
                 regime = bot_state["symbol_regimes"].get(symbol.replace("/",""), "UNKNOWN")
 
+                # Gap doesn't take a timeframe param
+                if len(bot_state["strategy_positions"]["Gap"]) < RISK["max_positions_per_strategy"]:
+                    sig = run_weekend_gap(symbol, regime)
+                    if sig: try_entry(symbol, "Gap", sig, regime, now)
+
+                # 5M + 15M scanning for the 4 core strategies (FIX: 15M timeframe added)
                 for strat, run_fn in [("Breakout", run_breakout), ("VPA", run_vpa),
                                       ("MSS", run_mss), ("EMA", run_ema)]:
                     if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
-                        sig = run_fn(symbol, regime)
-                        if sig: try_entry(symbol, strat, sig, regime, now)
+                        sig_5m = run_fn(symbol, regime, "5Min")
+                        if sig_5m: try_entry(symbol, strat, sig_5m, regime, now)
+                    if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
+                        sig_15m = run_fn(symbol, regime, "15Min")
+                        if sig_15m: try_entry(symbol, strat, sig_15m, regime, now)
 
         except Exception as e:
             log.error(f"Loop error: {e}"); import traceback; log.error(traceback.format_exc())
