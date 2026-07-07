@@ -92,7 +92,7 @@ bot_state = {
     "symbol_lockouts": {},  # symbol -> lockout expiry ISO timestamp
     "prev_week_closes": {},  # For weekend gap detection
     "gap_fired_this_week": {},
-    "version": "Combined-4.0"
+    "version": "Combined-4.0.1"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
@@ -280,7 +280,9 @@ def can_enter(symbol, strategy):
     return True
 
 def record_exit(symbol, strategy, pnl, win):
-    bot_state["strategy_positions"][strategy] = [s for s in bot_state["strategy_positions"][strategy] if s != symbol]
+    # Handle legacy positions with "UNKNOWN" strategy from pre-redeploy
+    if strategy in bot_state["strategy_positions"]:
+        bot_state["strategy_positions"][strategy] = [s for s in bot_state["strategy_positions"][strategy] if s != symbol]
     bot_state["day_pnl"] += pnl; bot_state["total_trades"] += 1
     if win: bot_state["win_count"] += 1
     s = bot_state["strategy_stats"][strategy]
