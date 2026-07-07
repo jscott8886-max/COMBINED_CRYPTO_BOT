@@ -20,7 +20,7 @@ API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
 
 SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
-           "AVAX/USD", "LINK/USD", "LTC/USD", "ADA/USD", "UNI/USD"]
+           "LINK/USD", "LTC/USD", "ADA/USD"]  # AVAX + UNI removed — 0% win rate across 2 weeks
 STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap"]
 
 EMA_CONFIG = {
@@ -41,7 +41,7 @@ MSS_CONFIG = {
 VPA_CONFIG = {
     "name": "VPA", "volume_spike_mult": 2.0, "volume_avg_period": 20,
     "min_close_ratio": 0.6, "effort_result_ratio": 0.02,
-    "min_score": 3, "min_score_confirmed": 3,  # FIX: raised 2->3, weak confirms killed win rate
+    "min_score": 4, "min_score_confirmed": 4,  # FIX: raised to 4 — score 3 still lost 80%+
     "bear_score_cap": 4,  # FIX: cap score at 4 in bear regime — score 5 = distribution not accumulation
     "time_filter": False, "bear_filter": False,
 }
@@ -69,8 +69,9 @@ SESSION_WINDOWS_UTC = [
 RISK = {
     "position_size": 0.12, "stop_loss_pct": 0.75, "take_profit_pct": 1.5,
     "max_positions_per_strategy": 2, "max_total_positions": 6,
-    "cooldown_minutes": 10, "daily_loss_limit_pct": 5.0,
-    "time_exit_minutes": 30,  # FIX: close if not profitable after 30min
+    "cooldown_minutes": 10, "vpa_cooldown_minutes": 120,  # FIX: VPA gets 2-hour cooldown to prevent loss loops
+    "daily_loss_limit_pct": 5.0,
+    "time_exit_minutes": 60,  # FIX: extended 30→60 — crypto wins avg 45min-4hrs, 30 was too aggressive
 }
 
 bot_state = {
@@ -87,9 +88,11 @@ bot_state = {
     "active_cooldowns": {}, "daily_paused": False,
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
     "pending_confirmation": {},
+    "consecutive_losses": {},  # symbol -> count of consecutive losses
+    "symbol_lockouts": {},  # symbol -> lockout expiry ISO timestamp
     "prev_week_closes": {},  # For weekend gap detection
     "gap_fired_this_week": {},
-    "version": "Combined-3.0"
+    "version": "Combined-4.0"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
@@ -257,10 +260,22 @@ def can_enter(symbol, strategy):
     if len(bot_state["positions"]) >= RISK["max_total_positions"]: return False
     if len(bot_state["strategy_positions"][strategy]) >= RISK["max_positions_per_strategy"]: return False
     if symbol in bot_state["positions"]: return False
+
+    # FIX 6: Check consecutive loss lockout (3 losses → 6 hour ban)
+    lockout = bot_state["symbol_lockouts"].get(symbol)
+    if lockout:
+        if datetime.now(timezone.utc) < datetime.fromisoformat(lockout):
+            return False
+        else:
+            del bot_state["symbol_lockouts"][symbol]
+            bot_state["consecutive_losses"][symbol] = 0
+
+    # FIX 4: VPA gets 2-hour cooldown, others get 10 minutes
     ck = f"{strategy}_{symbol}"
     if ck in bot_state["active_cooldowns"]:
+        cooldown = RISK["vpa_cooldown_minutes"] if strategy == "VPA" else RISK["cooldown_minutes"]
         elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(bot_state["active_cooldowns"][ck])).total_seconds() / 60
-        if elapsed < RISK["cooldown_minutes"]: return False
+        if elapsed < cooldown: return False
         del bot_state["active_cooldowns"][ck]
     return True
 
@@ -270,7 +285,17 @@ def record_exit(symbol, strategy, pnl, win):
     if win: bot_state["win_count"] += 1
     s = bot_state["strategy_stats"][strategy]
     s["trades"] += 1; s["pnl"] = round(s["pnl"] + pnl, 2)
-    if win: s["wins"] += 1
+    if win:
+        s["wins"] += 1
+        bot_state["consecutive_losses"][symbol] = 0  # Reset on win
+    else:
+        # FIX 6: Track consecutive losses — 3 in a row = 6 hour ban
+        count = bot_state["consecutive_losses"].get(symbol, 0) + 1
+        bot_state["consecutive_losses"][symbol] = count
+        if count >= 3:
+            lockout_until = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+            bot_state["symbol_lockouts"][symbol] = lockout_until
+            log.info(f"[LOCKOUT] {symbol} locked out for 6 hours after {count} consecutive losses")
 
 # ── STRATEGIES ─────────────────────────────────────────────────────────
 def run_ema(symbol, regime, tf="5Min"):
@@ -402,7 +427,10 @@ def run_vpa(symbol, regime, tf="5Min"):
         if vol_ratio >= 2.5 and price_move < cfg["effort_result_ratio"]:
             if closes[-1] > opens[-1]: score += 2; signals_detected.append("ABSORPTION_BULL")
         if vol_ratio < 0.7 and closes[-1] > opens[-1] and close_ratio > 0.5:
-            score += 1; signals_detected.append("NO_SUPPLY")
+            # FIX: NO_SUPPLY only counts when combined with a real volume signal
+            # By itself it's noise — fires constantly on every coin
+            if len(signals_detected) > 0:  # Only add if VOL_SPIKE or ABSORPTION already detected
+                score += 1; signals_detected.append("NO_SUPPLY")
         ema20 = calc_ema(closes, 20)
         if ema20 and price > ema20[-1]: score += 1
 
@@ -620,11 +648,11 @@ def trading_loop():
         log.warning("No Alpaca credentials"); return
 
     add_diary("SYSTEM",
-        "Combined Crypto v3.0 started | 5 Strategies (+WeekendGap) | 10 Coins | "
-        "VPA confirmed 2->3 | Bear score cap 4 | 30min time exit | "
-        "Score 4+ skips confirmation | Session momentum boost | "
-        "VPA+Breakout no bear filter", "system")
-    log.info("Combined Crypto Bot v3.0 started")
+        "Combined Crypto v4.0 started | 5 Strategies | 8 Coins (-AVAX -UNI) | "
+        "VPA min score 4 | NO_SUPPLY standalone removed | "
+        "VPA 2hr cooldown | 60min time exit | "
+        "3-loss 6hr lockout | EMA+MSS priority over VPA", "system")
+    log.info("Combined Crypto Bot v4.0 started")
 
     regime_check_time = None; daily_reset_date = None
     while True:
@@ -669,9 +697,10 @@ def trading_loop():
                     sig = run_weekend_gap(symbol, regime)
                     if sig: try_entry(symbol, "Gap", sig, regime, now)
 
-                # 5M + 15M scanning for the 4 core strategies (FIX: 15M timeframe added)
-                for strat, run_fn in [("Breakout", run_breakout), ("VPA", run_vpa),
-                                      ("MSS", run_mss), ("EMA", run_ema)]:
+                # FIX 7: Reordered — EMA and MSS get priority over VPA
+                # Gap > Breakout > EMA > MSS > VPA (VPA is last — fills remaining slots only)
+                for strat, run_fn in [("Breakout", run_breakout), ("EMA", run_ema),
+                                      ("MSS", run_mss), ("VPA", run_vpa)]:
                     if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
                         sig_5m = run_fn(symbol, regime, "5Min")
                         if sig_5m: try_entry(symbol, strat, sig_5m, regime, now)
