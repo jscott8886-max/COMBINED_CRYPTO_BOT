@@ -92,7 +92,7 @@ bot_state = {
     "symbol_lockouts": {},  # symbol -> lockout expiry ISO timestamp
     "prev_week_closes": {},  # For weekend gap detection
     "gap_fired_this_week": {},
-    "version": "Combined-4.0.1"
+    "version": "Combined-4.1"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
@@ -621,7 +621,11 @@ def try_entry(symbol, strategy, sig, regime, now):
         if sym_regime == "BEAR" and cfg.get("bear_filter"): return
         if not is_in_time_window(cfg): return
     elif strategy == "VPA":
-        pass  # No bear filter, no time filter
+        # FIX: VPA DISABLED in bear regime — 0% win rate over 100+ trades in bear market
+        # Volume signals are unreliable when the overall trend is down
+        # VPA only activates when per-symbol regime is BULL or UNKNOWN
+        if sym_regime == "BEAR":
+            return
     elif strategy == "Breakout":
         if not sig.get("buy_signal") and not confirmed: return
         if sym_regime == "BEAR" and not sig.get("momentum_override"): return
@@ -650,11 +654,11 @@ def trading_loop():
         log.warning("No Alpaca credentials"); return
 
     add_diary("SYSTEM",
-        "Combined Crypto v4.0 started | 5 Strategies | 8 Coins (-AVAX -UNI) | "
-        "VPA min score 4 | NO_SUPPLY standalone removed | "
+        "Combined Crypto v4.1 started | 5 Strategies | 8 Coins (-AVAX -UNI) | "
+        "VPA DISABLED in bear regime | NO_SUPPLY standalone removed | "
         "VPA 2hr cooldown | 60min time exit | "
         "3-loss 6hr lockout | EMA+MSS priority over VPA", "system")
-    log.info("Combined Crypto Bot v4.0 started")
+    log.info("Combined Crypto Bot v4.1 started")
 
     regime_check_time = None; daily_reset_date = None
     while True:
