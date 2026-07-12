@@ -1,13 +1,14 @@
-# ScalpAI Combined Crypto Bot - v2.0
-# 4 Strategies: EMA + MSS + VPA + Breakout
-# 10 Coins: BTC ETH SOL XRP DOGE AVAX LINK LTC ADA UNI
-# Confirmation candles, 2 pos/strategy, 10min cooldown
-# VPA+Breakout no bear filter, momentum override 1.5%
+# ScalpAI Combined Crypto Bot - v4.1
+# 5 Strategies: EMA + MSS + VPA + Breakout + WeekendGap
+# 8 Coins: BTC ETH SOL XRP DOGE LINK LTC ADA (AVAX+UNI removed)
+# VPA DISABLED in bear regime | 60min time exit
+# 2hr VPA cooldown | 3-loss 6hr lockout | EMA+MSS priority
 import os, time, logging, math
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import threading
+import requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
@@ -18,6 +19,10 @@ CORS(app)
 API_KEY    = os.environ.get("ALPACA_API_KEY", "")
 API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
 PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
 
 SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
            "LINK/USD", "LTC/USD", "ADA/USD"]  # AVAX + UNI removed — 0% win rate across 2 weeks
@@ -92,7 +97,8 @@ bot_state = {
     "symbol_lockouts": {},  # symbol -> lockout expiry ISO timestamp
     "prev_week_closes": {},  # For weekend gap detection
     "gap_fired_this_week": {},
-    "version": "Combined-4.1"
+    "loss_streak": 0,
+    "version": "Combined-5.0"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
@@ -184,6 +190,17 @@ def add_diary(symbol, text, entry_type="info", strategy="SYSTEM"):
     bot_state["diary"].insert(0, entry)
     if len(bot_state["diary"]) > 300: bot_state["diary"] = bot_state["diary"][:300]
 
+
+def send_telegram(message):
+    """Send notification to Telegram"""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}, timeout=5)
+    except Exception as e:
+        log.error(f"Telegram error: {e}")
+
 # ── Indicators ─────────────────────────────────────────────────────────
 def calc_ema(prices, period):
     if len(prices) < period: return []
@@ -213,6 +230,33 @@ def calc_atr(bars, period=14):
         trs.append(max(bars[i]["high"]-bars[i]["low"], abs(bars[i]["high"]-bars[i-1]["close"]), abs(bars[i]["low"]-bars[i-1]["close"])))
     return sum(trs[-period:]) / period if len(trs) >= period else sum(trs)/len(trs)
 
+def calc_adx(bars, period=14):
+    """ADX trend strength — above 25 = trending, below 20 = choppy"""
+    if len(bars) < period * 2 + 1: return 0.0
+    try:
+        plus_dm, minus_dm, tr_list = [], [], []
+        for i in range(1, len(bars)):
+            h = bars[i]["high"]; l = bars[i]["low"]
+            ph = bars[i-1]["high"]; pl = bars[i-1]["low"]; pc = bars[i-1]["close"]
+            tr_list.append(max(h-l, abs(h-pc), abs(l-pc)))
+            up = h - ph; down = pl - l
+            plus_dm.append(up if up > down and up > 0 else 0)
+            minus_dm.append(down if down > up and down > 0 else 0)
+        if len(tr_list) < period: return 0.0
+        atr = sum(tr_list[:period]) / period
+        pdi_sum = sum(plus_dm[:period]) / period
+        mdi_sum = sum(minus_dm[:period]) / period
+        for i in range(period, len(tr_list)):
+            atr = (atr * (period-1) + tr_list[i]) / period
+            pdi_sum = (pdi_sum * (period-1) + plus_dm[i]) / period
+            mdi_sum = (mdi_sum * (period-1) + minus_dm[i]) / period
+        if atr == 0: return 0.0
+        pdi = (pdi_sum / atr) * 100; mdi = (mdi_sum / atr) * 100
+        di_sum = pdi + mdi
+        if di_sum == 0: return 0.0
+        return abs(pdi - mdi) / di_sum * 100
+    except: return 0.0
+
 def check_market_regime():
     try:
         bars = get_bars("BTC/USD", "1Day", 210)
@@ -230,8 +274,14 @@ def check_symbol_regime(symbol):
         if len(bars) < 200: return "UNKNOWN"
         closes = [b["close"] for b in bars]; ema200 = calc_ema(closes, 200)
         if not ema200: return "UNKNOWN"
-        regime = "BULL" if closes[-1] > ema200[-1] else "BEAR"
-        log.info(f"Regime {symbol}: {regime} | price={closes[-1]:.4f} | 200EMA={ema200[-1]:.4f}")
+        # FIX: 2% buffer — price must be 2% ABOVE 200 EMA to count as BULL
+        # Prevents whipsaw entries when price flip-flops at the EMA boundary
+        pct_above = (closes[-1] - ema200[-1]) / ema200[-1] * 100
+        if pct_above >= 2.0:
+            regime = "BULL"
+        else:
+            regime = "BEAR"
+        log.info(f"Regime {symbol}: {regime} | price={closes[-1]:.4f} | 200EMA={ema200[-1]:.4f} | {pct_above:.1f}% above")
         return regime
     except Exception as e: log.error(f"Symbol regime error {symbol}: {e}"); return "UNKNOWN"
 
@@ -289,8 +339,15 @@ def record_exit(symbol, strategy, pnl, win):
     s["trades"] += 1; s["pnl"] = round(s["pnl"] + pnl, 2)
     if win:
         s["wins"] += 1
-        bot_state["consecutive_losses"][symbol] = 0  # Reset on win
+        bot_state["consecutive_losses"][symbol] = 0
+        bot_state["loss_streak"] = 0
+        send_telegram(f"✅ <b>Crypto WIN</b> [{strategy}] {symbol}\n"
+                      f"P&L: +${abs(pnl):.2f} ({round(pnl/(bot_state['account_equity'] or 1)*100,2)}%) | {bot_state['total_trades']} trades")
     else:
+        bot_state["loss_streak"] += 1
+        if bot_state["loss_streak"] >= 2:
+            send_telegram(f"⚠️ <b>Crypto losing streak:</b> {bot_state['loss_streak']} in a row\n"
+                          f"Latest: {symbol} ${pnl:.2f}")
         # FIX 6: Track consecutive losses — 3 in a row = 6 hour ban
         count = bot_state["consecutive_losses"].get(symbol, 0) + 1
         bot_state["consecutive_losses"][symbol] = count
@@ -654,11 +711,12 @@ def trading_loop():
         log.warning("No Alpaca credentials"); return
 
     add_diary("SYSTEM",
-        "Combined Crypto v4.1 started | 5 Strategies | 8 Coins (-AVAX -UNI) | "
+        "Combined Crypto v5.0 started | 5 Strategies | 8 Coins (-AVAX -UNI) | "
         "VPA DISABLED in bear regime | NO_SUPPLY standalone removed | "
         "VPA 2hr cooldown | 60min time exit | "
         "3-loss 6hr lockout | EMA+MSS priority over VPA", "system")
-    log.info("Combined Crypto Bot v4.1 started")
+    log.info("Combined Crypto Bot v5.0 started")
+    send_telegram("🚀 <b>Crypto Bot v5.0 started</b>\n8 coins | ADX filter | 2% regime buffer")
 
     regime_check_time = None; daily_reset_date = None
     while True:
