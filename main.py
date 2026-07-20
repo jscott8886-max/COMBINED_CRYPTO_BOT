@@ -98,7 +98,7 @@ bot_state = {
     "prev_week_closes": {},  # For weekend gap detection
     "gap_fired_this_week": {},
     "loss_streak": 0,
-    "version": "Combined-5.0"
+    "version": "Combined-5.1"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
@@ -635,6 +635,9 @@ def check_exits(symbol, price, now):
     if not pos: return
     entry = pos["entry"]; qty = pos["qty"]; strategy = pos.get("strategy", "UNKNOWN")
     pct = (price - entry) / entry * 100
+    # NOTE: Alpaca crypto does NOT support server-side bracket orders (equities only).
+    # We mitigate SL-overshoot risk with a catastrophic-stop check below that closes
+    # immediately on any check where price has gapped well past the intended SL.
     should_exit = False; reason = ""
 
     # FIX: 30-minute time exit — cut losers early, they rarely recover (data confirmed)
@@ -647,6 +650,9 @@ def check_exits(symbol, price, now):
     elif pct <= -RISK["stop_loss_pct"]:
         should_exit = True; reason = f"Stop loss ({round(pct,2)}%)"
         bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
+        # Catastrophic stop: if price gapped way past SL (2x the intended), flag it
+        if pct <= -(RISK["stop_loss_pct"] * 2):
+            log.warning(f"CATASTROPHIC STOP {symbol}: {round(pct,2)}% — gapped past SL, closing immediately")
     elif minutes_open >= RISK["time_exit_minutes"] and pct < 0:
         should_exit = True; reason = f"30min time exit ({round(pct,2)}%)"
         bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
@@ -715,8 +721,8 @@ def trading_loop():
         "VPA DISABLED in bear regime | NO_SUPPLY standalone removed | "
         "VPA 2hr cooldown | 60min time exit | "
         "3-loss 6hr lockout | EMA+MSS priority over VPA", "system")
-    log.info("Combined Crypto Bot v5.0 started")
-    send_telegram("🚀 <b>Crypto Bot v5.0 started</b>\n8 coins | ADX filter | 2% regime buffer")
+    log.info("Combined Crypto Bot v5.1 started")
+    send_telegram("🚀 <b>Crypto Bot v5.1 started</b>\n8 coins | ADX filter | 2% regime buffer")
 
     regime_check_time = None; daily_reset_date = None
     while True:
