@@ -1,7 +1,8 @@
-# ForexAI Combined Bot - v7.0
-# 4 Strategies: EMA + MSS + VPA + Breakout | LONG + SHORT
-# 7 Pairs | ADX trend filter | Short selling enabled
-# No time exit — TP/SL natural exits
+# ScalpAI Combined Crypto Bot - v4.1
+# 5 Strategies: EMA + MSS + VPA + Breakout + WeekendGap
+# 8 Coins: BTC ETH SOL XRP DOGE LINK LTC ADA (AVAX+UNI removed)
+# VPA DISABLED in bear regime | 60min time exit
+# 2hr VPA cooldown | 3-loss 6hr lockout | EMA+MSS priority
 import os, time, logging, math
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
@@ -15,195 +16,172 @@ log = logging.getLogger(__name__)
 app = Flask(__name__)
 CORS(app)
 
-OANDA_API_KEY    = os.environ.get("OANDA_API_KEY", "")
-OANDA_ACCOUNT_ID = os.environ.get("OANDA_ACCOUNT_ID", "")
-PAPER_MODE       = os.environ.get("PAPER_MODE", "true").lower() == "true"
-OANDA_ENV        = "practice" if PAPER_MODE else "live"
+API_KEY    = os.environ.get("ALPACA_API_KEY", "")
+API_SECRET = os.environ.get("ALPACA_API_SECRET", "")
+PAPER_MODE = os.environ.get("PAPER_MODE", "true").lower() == "true"
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
-SYMBOLS = ["EUR_USD", "GBP_USD", "USD_JPY", "AUD_USD", "USD_CAD", "USD_CHF", "NZD_USD"]
-STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Sweep"]
+SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
+           "LINK/USD", "LTC/USD", "ADA/USD"]  # AVAX + UNI removed — 0% win rate across 2 weeks
+STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap"]
 
 EMA_CONFIG = {
-    "name": "EMA", "rsi_hard_gate": 55, "bb_min_bw": 0.05,
+    "name": "EMA", "ema_fast": 9, "ema_slow": 21, "ema_trend": 50,
+    "rsi_period": 14, "rsi_hard_gate": 55, "rsi_entry_max": 40,
+    "bb_period": 20, "bb_std": 2.0, "bb_min_bw": 1.5,
     "min_score": 4, "min_score_confirmed": 3,
-    "atr_min_mult": 0.7, "volume_bonus_mult": 1.5,
-    "adx_min": 20,            # shorts still use this floor
-    "adx_min_long": 25,       # FIX 2: longs need a stronger trend (ADX 20-25 dead zone went 1W/5L)
-    "block_long_in_bear": True,  # FIX 1: EMA longs in BEAR regime lost $54 this week — shorts only
-    "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,
-    "blocked_pairs": [],
+    "atr_min_mult": 0.8, "volume_bonus_mult": 1.5,
+    "time_filter": True, "time_start_utc": 13, "time_end_utc": 21,
+    "bear_filter": True,
 }
 MSS_CONFIG = {
     "name": "MSS", "swing_lookback": 10, "swing_fallback": 7, "fallback_hours": 4,
-    "rsi_soft_threshold": 50, "atr_min_mult": 0.7, "volume_bonus_mult": 1.5,
-    "adx_min": 20,
-    "time_filter": True, "time_start_utc": 12, "time_end_utc": 17,
-    "blocked_pairs": ["AUD_USD"],
+    "rsi_soft_threshold": 50, "atr_min_mult": 0.8, "volume_bonus_mult": 1.5,
+    "time_filter": True, "time_start_utc": 13, "time_end_utc": 21,
+    "bear_filter": True, "min_score": 4, "min_score_confirmed": 3,
 }
 VPA_CONFIG = {
     "name": "VPA", "volume_spike_mult": 2.0, "volume_avg_period": 20,
     "min_close_ratio": 0.6, "effort_result_ratio": 0.02,
-    "min_score": 3, "min_score_confirmed": 3, "bear_score_cap": 4,
-    "adx_min": 18,
-    "time_filter": False, "blocked_pairs": [],
+    "min_score": 4, "min_score_confirmed": 4,  # FIX: raised to 4 — score 3 still lost 80%+
+    "bear_score_cap": 4,  # FIX: cap score at 4 in bear regime — score 5 = distribution not accumulation
+    "time_filter": False, "bear_filter": False,
 }
 BREAKOUT_CONFIG = {
-    "name": "Breakout", "consolidation_candles": 8, "consolidation_pips": 15,
-    "breakout_volume_mult": 2.0, "breakout_candle_close_ratio": 0.65,
-    "min_breakout_pips": 3, "min_score": 4, "min_score_confirmed": 3,
-    "adx_min": 22,
-    "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,
-    "blocked_pairs": ["USD_CAD"],
-}
-SWEEP_CONFIG = {
-    "name": "Sweep",
-    "swing_lookback": 20,        # bars to find the swing high/low being swept
-    "min_sweep_pips": 2,         # price must poke at least this far past the level
-    "max_sweep_pips": 15,        # but not run away — a sweep, not a trend break
-    "volume_mult": 1.5,          # sweep candle should have elevated volume (stop run)
-    "min_score": 4,
-    "time_filter": True, "time_start_utc": 7, "time_end_utc": 17,
-    "blocked_pairs": [],
-    # NOTE: Sweep has NO adx_min — it deliberately trades REVERSALS, not trends.
-    # A liquidity sweep is a failed breakout; high ADX would filter out the best setups.
+    "name": "Breakout", "consolidation_candles": 10, "consolidation_threshold": 0.8,
+    "breakout_volume_mult": 2.0, "breakout_candle_close_ratio": 0.6,
+    "min_breakout_pct": 0.5,
+    "momentum_override_pct": 1.5, "momentum_override_volume": 2.5,
+    "min_score": 4, "min_score_confirmed": 3,
+    "time_filter": False, "bear_filter": False,
 }
 
+GAP_CONFIG = {
+    "name": "WeekendGap", "min_gap_pct": 1.0, "max_gap_pct": 8.0,
+    "volume_confirm_mult": 1.3, "min_score": 4,
+}
+
+# Session open windows (UTC) for momentum boost — not fake gaps, real volume windows
+SESSION_WINDOWS_UTC = [
+    (0, 0.5),    # Tokyo open ~00:00 UTC (8PM ET)
+    (7, 7.5),    # London open ~07:00 UTC (3AM ET)
+    (13.5, 14),  # NY open ~13:30 UTC (9:30AM ET)
+]
+
 RISK = {
-    "position_units": 5000, "stop_loss_pips": 12, "take_profit_pips": 22,
+    "position_size": 0.12, "stop_loss_pct": 0.75, "take_profit_pct": 1.5,
     "max_positions_per_strategy": 2, "max_total_positions": 6,
-    "cooldown_minutes": 10, "mss_cooldown_minutes": 120,
-    "counter_trend_units": 2500,  # FIX: half size when trading against trend
+    "cooldown_minutes": 10, "vpa_cooldown_minutes": 120,  # FIX: VPA gets 2-hour cooldown to prevent loss loops
     "daily_loss_limit_pct": 5.0,
+    "time_exit_minutes": 60,  # FIX: extended 30→60 — crypto wins avg 45min-4hrs, 30 was too aggressive
 }
 
 bot_state = {
-    "running": True, "killed": False,
-    "positions": {}, "strategy_positions": {s: [] for s in STRATEGIES},
+    "running": True, "killed": False, "positions": {},
+    "strategy_positions": {s: [] for s in STRATEGIES},
     "closed_trades": [], "diary": [],
-    "day_pnl": 0.0, "daily_start_nav": 0.0,
+    "day_pnl": 0.0, "daily_start_equity": 0.0,
     "total_trades": 0, "win_count": 0,
     "strategy_stats": {s: {"trades": 0, "wins": 0, "pnl": 0.0} for s in STRATEGIES},
-    "long_stats": {"trades": 0, "wins": 0, "pnl": 0.0},
-    "short_stats": {"trades": 0, "wins": 0, "pnl": 0.0},
-    "signals": {sym: {s: {} for s in STRATEGIES} for sym in SYMBOLS},
-    "account_balance": 0.0, "account_equity": 0.0, "account_nav": 0.0,
-    "active_cooldowns": {}, "market_regime": {sym: "UNKNOWN" for sym in SYMBOLS},
-    "market_open": False, "in_trading_window": False,
-    "daily_paused": False, "pending_confirmation": {},
+    "signals": {sym.replace("/",""): {s: {} for s in STRATEGIES} for sym in SYMBOLS},
+    "account_cash": 0.0, "account_equity": 0.0, "account_buying_power": 0.0,
+    "market_regime": "UNKNOWN",
+    "symbol_regimes": {sym.replace("/",""): "UNKNOWN" for sym in SYMBOLS},
+    "active_cooldowns": {}, "daily_paused": False,
     "mss_last_signal_time": {sym: None for sym in SYMBOLS},
+    "pending_confirmation": {},
+    "consecutive_losses": {},  # symbol -> count of consecutive losses
+    "symbol_lockouts": {},  # symbol -> lockout expiry ISO timestamp
+    "prev_week_closes": {},  # For weekend gap detection
+    "gap_fired_this_week": {},
     "loss_streak": 0,
-    "version": "ForexCombined-8.2"
+    "version": "Combined-5.1"
 }
 
-# ── OANDA helpers ──────────────────────────────────────────────────────
-def get_oanda_client():
-    import oandapyV20
-    return oandapyV20.API(access_token=OANDA_API_KEY, environment=OANDA_ENV)
+# ── Alpaca helpers ─────────────────────────────────────────────────────
+def get_trading_client():
+    from alpaca.trading.client import TradingClient
+    return TradingClient(api_key=API_KEY, secret_key=API_SECRET, paper=PAPER_MODE)
 
-def get_candles(symbol, granularity="M5", count=100):
+def get_data_client():
+    from alpaca.data.historical import CryptoHistoricalDataClient
+    return CryptoHistoricalDataClient(api_key=API_KEY, secret_key=API_SECRET)
+
+def get_bars(symbol, timeframe="5Min", limit=50):
     try:
-        import oandapyV20.endpoints.instruments as instruments
-        client = get_oanda_client()
-        params = {"granularity": granularity, "count": count, "price": "M"}
-        r = instruments.InstrumentsCandles(instrument=symbol, params=params)
-        client.request(r)
+        from alpaca.data.requests import CryptoBarsRequest
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+        client = get_data_client()
+        tf_map = {"1Min": TimeFrame(1, TimeFrameUnit.Minute), "5Min": TimeFrame(5, TimeFrameUnit.Minute),
+                  "15Min": TimeFrame(15, TimeFrameUnit.Minute),
+                  "1Hour": TimeFrame(1, TimeFrameUnit.Hour), "1Day": TimeFrame(1, TimeFrameUnit.Day)}
+        tf = tf_map.get(timeframe, TimeFrame(5, TimeFrameUnit.Minute))
+        end = datetime.now(timezone.utc)
+        if timeframe == "1Day": start = end - timedelta(days=limit + 10)
+        elif timeframe == "1Hour": start = end - timedelta(hours=limit + 5)
+        else: start = end - timedelta(minutes=limit * 6)
+        req = CryptoBarsRequest(symbol_or_symbols=symbol, timeframe=tf, start=start, limit=limit)
+        bars = client.get_crypto_bars(req)
+        df = bars.df
+        if df.empty: return []
+        if hasattr(df.index, 'levels'):
+            df = df.loc[symbol] if symbol in df.index.get_level_values(0) else df
         result = []
-        for c in r.response.get("candles", []):
-            if c.get("complete", False):
-                m = c["mid"]
-                result.append({"time": c["time"], "open": float(m["o"]), "high": float(m["h"]),
-                    "low": float(m["l"]), "close": float(m["c"]), "volume": int(c.get("volume", 0))})
-        return result
+        for idx, row in df.iterrows():
+            result.append({"time": idx.isoformat() if hasattr(idx, 'isoformat') else str(idx),
+                "open": float(row["open"]), "high": float(row["high"]),
+                "low": float(row["low"]), "close": float(row["close"]),
+                "volume": float(row["volume"])})
+        return result[-limit:]
     except Exception as e:
-        log.error(f"Candles error {symbol}: {e}"); return []
+        log.error(f"Bars error {symbol}: {e}"); return []
 
-def pip_value(symbol): return 0.01 if "JPY" in symbol else 0.0001
-def pips(symbol, diff): return abs(diff) / pip_value(symbol)
-def calc_pnl(symbol, entry, exit_price, units):
-    raw = (exit_price - entry) * units
-    if "JPY" in symbol: return raw / exit_price
-    return raw
-
-def is_market_open():
-    now = datetime.now(timezone.utc)
-    wd = now.weekday(); h = now.hour + now.minute/60
-    if wd == 4 and h >= 21: return False
-    if wd == 5: return False
-    if wd == 6 and h < 21: return False
-    return True
-
-def is_trading_window(cfg):
-    if not cfg.get("time_filter", False): return True
-    now = datetime.now(timezone.utc)
-    return cfg["time_start_utc"] <= now.hour + now.minute/60 <= cfg["time_end_utc"]
-
-def get_account_info():
+def refresh_account():
     try:
-        import oandapyV20.endpoints.accounts as accounts
-        client = get_oanda_client()
-        r = accounts.AccountSummary(OANDA_ACCOUNT_ID); client.request(r)
-        acct = r.response["account"]
-        bot_state["account_balance"] = float(acct.get("balance", 0))
-        bot_state["account_nav"] = float(acct.get("NAV", 0))
-        bot_state["account_equity"] = float(acct.get("NAV", 0))
-        if bot_state["daily_start_nav"] == 0.0:
-            bot_state["daily_start_nav"] = float(acct.get("NAV", 0))
+        tc = get_trading_client(); acct = tc.get_account()
+        bot_state["account_cash"] = float(acct.cash)
+        bot_state["account_equity"] = float(acct.equity)
+        bot_state["account_buying_power"] = float(acct.buying_power)
+        if bot_state["daily_start_equity"] == 0.0:
+            bot_state["daily_start_equity"] = float(acct.equity)
     except Exception as e: log.error(f"Account error: {e}")
 
 def sync_positions():
     try:
-        import oandapyV20.endpoints.trades as trades
-        client = get_oanda_client()
-        r = trades.OpenTrades(OANDA_ACCOUNT_ID); client.request(r)
+        tc = get_trading_client(); positions = tc.get_all_positions()
         synced = {}; active = set()
-        for t in r.response.get("trades", []):
-            sym = t["instrument"]
-            if sym not in SYMBOLS: continue
-            active.add(sym); existing = bot_state["positions"].get(sym, {})
-            units = int(t["currentUnits"])
-            synced[sym] = {"symbol": sym, "entry": float(t["price"]),
-                "units": abs(units), "side": "short" if units < 0 else "long",
-                "trade_id": t["id"],
+        for p in positions:
+            sym = p.symbol
+            if "/" not in sym and len(sym) > 3: sym = sym[:-3] + "/" + sym[-3:]
+            active.add(sym)
+            existing = bot_state["positions"].get(sym, {})
+            synced[sym] = {"symbol": sym, "entry": float(p.avg_entry_price),
+                "qty": float(p.qty), "current_price": float(p.current_price),
+                "unrealized_pnl": float(p.unrealized_pl),
                 "open_time": existing.get("open_time", datetime.now(timezone.utc).isoformat()),
-                "current_price": float(t["price"]),
-                "unrealized_pnl": float(t.get("unrealizedPL", 0)),
                 "strategy": existing.get("strategy", "UNKNOWN")}
         for strat in STRATEGIES:
             bot_state["strategy_positions"][strat] = [s for s in bot_state["strategy_positions"][strat] if s in active]
         bot_state["positions"] = synced
     except Exception as e: log.error(f"Sync error: {e}")
 
-def place_order(symbol, units, side, tp_price=None, sl_price=None):
-    """Place market order with server-side SL/TP — OANDA executes stops instantly"""
+def place_order(symbol, qty, side):
     try:
-        import oandapyV20.endpoints.orders as orders
-        client = get_oanda_client()
-        actual = units if side == "BUY" else -units
-        # Determine pip precision
-        precision = 3 if "JPY" in symbol else 5
-        order_data = {"type": "MARKET", "instrument": symbol, "units": str(actual)}
-        # Server-side SL/TP — no more 60-second delay
-        if sl_price:
-            order_data["stopLossOnFill"] = {"price": str(round(sl_price, precision))}
-        if tp_price:
-            order_data["takeProfitOnFill"] = {"price": str(round(tp_price, precision))}
-        data = {"order": order_data}
-        r = orders.OrderCreate(OANDA_ACCOUNT_ID, data=data); client.request(r)
-        fill = r.response.get("orderFillTransaction", {})
-        return float(fill.get("price", 0))
+        from alpaca.trading.requests import MarketOrderRequest
+        from alpaca.trading.enums import OrderSide, TimeInForce
+        tc = get_trading_client()
+        req = MarketOrderRequest(symbol=symbol, qty=round(qty, 6),
+            side=OrderSide.BUY if side == "BUY" else OrderSide.SELL, time_in_force=TimeInForce.GTC)
+        return tc.submit_order(req)
     except Exception as e: log.error(f"Order error {symbol}: {e}"); return None
 
-def close_position(symbol, trade_id):
+def close_position_alpaca(symbol):
     try:
-        import oandapyV20.endpoints.trades as trades
-        client = get_oanda_client()
-        r = trades.TradeClose(OANDA_ACCOUNT_ID, trade_id); client.request(r)
-        return float(r.response.get("orderFillTransaction", {}).get("price", 0))
-    except Exception as e: log.error(f"Close error {symbol}: {e}"); return None
+        tc = get_trading_client(); tc.close_position(symbol.replace("/", "")); return True
+    except Exception as e: log.error(f"Close error {symbol}: {e}"); return False
 
 def add_diary(symbol, text, entry_type="info", strategy="SYSTEM"):
     label = f"[{strategy}] " if strategy != "SYSTEM" else ""
@@ -249,13 +227,11 @@ def calc_atr(bars, period=14):
     if len(bars) < period + 1: return 0.0
     trs = []
     for i in range(1, len(bars)):
-        h = bars[i]["high"]; l = bars[i]["low"]; pc = bars[i-1]["close"]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+        trs.append(max(bars[i]["high"]-bars[i]["low"], abs(bars[i]["high"]-bars[i-1]["close"]), abs(bars[i]["low"]-bars[i-1]["close"])))
     return sum(trs[-period:]) / period if len(trs) >= period else sum(trs)/len(trs)
 
 def calc_adx(bars, period=14):
-    """Average Directional Index — measures trend strength regardless of direction.
-    ADX > 25 = trending, ADX < 20 = choppy/ranging"""
+    """ADX trend strength — above 25 = trending, below 20 = choppy"""
     if len(bars) < period * 2 + 1: return 0.0
     try:
         plus_dm, minus_dm, tr_list = [], [], []
@@ -268,148 +244,183 @@ def calc_adx(bars, period=14):
             minus_dm.append(down if down > up and down > 0 else 0)
         if len(tr_list) < period: return 0.0
         atr = sum(tr_list[:period]) / period
-        plus_di_sum = sum(plus_dm[:period]) / period
-        minus_di_sum = sum(minus_dm[:period]) / period
+        pdi_sum = sum(plus_dm[:period]) / period
+        mdi_sum = sum(minus_dm[:period]) / period
         for i in range(period, len(tr_list)):
             atr = (atr * (period-1) + tr_list[i]) / period
-            plus_di_sum = (plus_di_sum * (period-1) + plus_dm[i]) / period
-            minus_di_sum = (minus_di_sum * (period-1) + minus_dm[i]) / period
+            pdi_sum = (pdi_sum * (period-1) + plus_dm[i]) / period
+            mdi_sum = (mdi_sum * (period-1) + minus_dm[i]) / period
         if atr == 0: return 0.0
-        plus_di = (plus_di_sum / atr) * 100
-        minus_di = (minus_di_sum / atr) * 100
-        di_sum = plus_di + minus_di
+        pdi = (pdi_sum / atr) * 100; mdi = (mdi_sum / atr) * 100
+        di_sum = pdi + mdi
         if di_sum == 0: return 0.0
-        dx = abs(plus_di - minus_di) / di_sum * 100
-        return dx
+        return abs(pdi - mdi) / di_sum * 100
     except: return 0.0
+
+def check_market_regime():
+    try:
+        bars = get_bars("BTC/USD", "1Day", 210)
+        if len(bars) < 200: return "UNKNOWN"
+        closes = [b["close"] for b in bars]; ema200 = calc_ema(closes, 200)
+        if not ema200: return "UNKNOWN"
+        regime = "BULL" if closes[-1] > ema200[-1] else "BEAR"
+        log.info(f"Global: {regime} | BTC={closes[-1]:.0f} | 200EMA={ema200[-1]:.0f}")
+        return regime
+    except Exception as e: log.error(f"Regime error: {e}"); return "UNKNOWN"
 
 def check_symbol_regime(symbol):
     try:
-        candles = get_candles(symbol, "D", 210)
-        if len(candles) < 200: return "UNKNOWN"
-        closes = [c["close"] for c in candles]; ema200 = calc_ema(closes, 200)
+        bars = get_bars(symbol, "1Day", 210)
+        if len(bars) < 200: return "UNKNOWN"
+        closes = [b["close"] for b in bars]; ema200 = calc_ema(closes, 200)
         if not ema200: return "UNKNOWN"
-        return "BULL" if closes[-1] > ema200[-1] else "BEAR"
-    except Exception as e: log.error(f"Regime error {symbol}: {e}"); return "UNKNOWN"
+        # FIX: 2% buffer — price must be 2% ABOVE 200 EMA to count as BULL
+        # Prevents whipsaw entries when price flip-flops at the EMA boundary
+        pct_above = (closes[-1] - ema200[-1]) / ema200[-1] * 100
+        if pct_above >= 2.0:
+            regime = "BULL"
+        else:
+            regime = "BEAR"
+        log.info(f"Regime {symbol}: {regime} | price={closes[-1]:.4f} | 200EMA={ema200[-1]:.4f} | {pct_above:.1f}% above")
+        return regime
+    except Exception as e: log.error(f"Symbol regime error {symbol}: {e}"); return "UNKNOWN"
 
-def can_enter(symbol, strategy, side="BUY"):
+def is_in_time_window(cfg):
+    if not cfg.get("time_filter", False): return True
+    now = datetime.now(timezone.utc)
+    return cfg["time_start_utc"] <= now.hour + now.minute/60 <= cfg["time_end_utc"]
+
+# ── Confirmation system ────────────────────────────────────────────────
+def check_confirmation(symbol, strategy, current_bar):
+    key = f"{symbol}_{strategy}_BUY"
+    pending = bot_state["pending_confirmation"].get(key)
+    if not pending: return False
+    confirmed = current_bar["close"] > current_bar["open"]
+    if confirmed: del bot_state["pending_confirmation"][key]; return True
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(pending["time"])).total_seconds()
+    if elapsed > 900: del bot_state["pending_confirmation"][key]
+    return False
+
+def set_pending(symbol, strategy, signal):
+    key = f"{symbol}_{strategy}_BUY"
+    bot_state["pending_confirmation"][key] = {"signal": signal, "time": datetime.now(timezone.utc).isoformat()}
+
+def can_enter(symbol, strategy):
     if bot_state["killed"] or bot_state["daily_paused"]: return False
     if len(bot_state["positions"]) >= RISK["max_total_positions"]: return False
     if len(bot_state["strategy_positions"][strategy]) >= RISK["max_positions_per_strategy"]: return False
     if symbol in bot_state["positions"]: return False
-    cfg_map = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG, "Sweep": SWEEP_CONFIG}
-    cfg = cfg_map.get(strategy, {})
-    if symbol in cfg.get("blocked_pairs", []): return False
+
+    # FIX 6: Check consecutive loss lockout (3 losses → 6 hour ban)
+    lockout = bot_state["symbol_lockouts"].get(symbol)
+    if lockout:
+        if datetime.now(timezone.utc) < datetime.fromisoformat(lockout):
+            return False
+        else:
+            del bot_state["symbol_lockouts"][symbol]
+            bot_state["consecutive_losses"][symbol] = 0
+
+    # FIX 4: VPA gets 2-hour cooldown, others get 10 minutes
     ck = f"{strategy}_{symbol}"
     if ck in bot_state["active_cooldowns"]:
-        cooldown = RISK["mss_cooldown_minutes"] if strategy == "MSS" else RISK["cooldown_minutes"]
+        cooldown = RISK["vpa_cooldown_minutes"] if strategy == "VPA" else RISK["cooldown_minutes"]
         elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(bot_state["active_cooldowns"][ck])).total_seconds() / 60
         if elapsed < cooldown: return False
         del bot_state["active_cooldowns"][ck]
     return True
 
-def record_exit(symbol, strategy, side, pnl, win):
+def record_exit(symbol, strategy, pnl, win):
+    # Handle legacy positions with "UNKNOWN" strategy from pre-redeploy
     if strategy in bot_state["strategy_positions"]:
         bot_state["strategy_positions"][strategy] = [s for s in bot_state["strategy_positions"][strategy] if s != symbol]
     bot_state["day_pnl"] += pnl; bot_state["total_trades"] += 1
+    if win: bot_state["win_count"] += 1
+    s = bot_state["strategy_stats"][strategy]
+    s["trades"] += 1; s["pnl"] = round(s["pnl"] + pnl, 2)
     if win:
-        bot_state["win_count"] += 1
+        s["wins"] += 1
+        bot_state["consecutive_losses"][symbol] = 0
         bot_state["loss_streak"] = 0
-        side_label = "LONG" if side == "long" else "SHORT"
-        send_telegram(f"✅ <b>Forex WIN</b> [{strategy}] {side_label} {symbol.replace('_','/')}\n"
-                      f"P&L: +${abs(pnl):.2f} | {bot_state['total_trades']} trades")
+        send_telegram(f"✅ <b>Crypto WIN</b> [{strategy}] {symbol}\n"
+                      f"P&L: +${abs(pnl):.2f} ({round(pnl/(bot_state['account_equity'] or 1)*100,2)}%) | {bot_state['total_trades']} trades")
     else:
         bot_state["loss_streak"] += 1
         if bot_state["loss_streak"] >= 2:
-            send_telegram(f"⚠️ <b>Forex losing streak:</b> {bot_state['loss_streak']} in a row\n"
-                          f"Latest: {symbol.replace('_','/')} ${pnl:.2f}")
-    if strategy in bot_state["strategy_stats"]:
-        s = bot_state["strategy_stats"][strategy]
-        s["trades"] += 1; s["pnl"] = round(s["pnl"] + pnl, 2)
-        if win: s["wins"] += 1
-    side_key = "long_stats" if side == "long" else "short_stats"
-    s = bot_state[side_key]
-    s["trades"] += 1; s["pnl"] = round(s["pnl"] + pnl, 2)
-    if win: s["wins"] += 1
+            send_telegram(f"⚠️ <b>Crypto losing streak:</b> {bot_state['loss_streak']} in a row\n"
+                          f"Latest: {symbol} ${pnl:.2f}")
+        # FIX 6: Track consecutive losses — 3 in a row = 6 hour ban
+        count = bot_state["consecutive_losses"].get(symbol, 0) + 1
+        bot_state["consecutive_losses"][symbol] = count
+        if count >= 3:
+            lockout_until = (datetime.now(timezone.utc) + timedelta(hours=6)).isoformat()
+            bot_state["symbol_lockouts"][symbol] = lockout_until
+            log.info(f"[LOCKOUT] {symbol} locked out for 6 hours after {count} consecutive losses")
 
-# ── STRATEGY A: EMA (LONG + SHORT) ────────────────────────────────────
-def run_ema(symbol, regime, tf="M5"):
+# ── STRATEGIES ─────────────────────────────────────────────────────────
+def run_ema(symbol, regime, tf="5Min"):
     cfg = EMA_CONFIG
     try:
-        bars = get_candles(symbol, tf, 80)
-        bars_1h = get_candles(symbol, "H1", 60)
-        if len(bars) < 30 or len(bars_1h) < 30: return {}
-        closes = [b["close"] for b in bars]; closes_1h = [b["close"] for b in bars_1h]
-        volumes = [b["volume"] for b in bars]; price = closes[-1]
+        bars_5m = get_bars(symbol, tf, 60); bars_1h = get_bars(symbol, "1Hour", 60)
+        if len(bars_5m) < 30 or len(bars_1h) < 30: return {}
+        closes = [b["close"] for b in bars_5m]; closes_1h = [b["close"] for b in bars_1h]
+        volumes = [b["volume"] for b in bars_5m]; price = closes[-1]
         if all(v == 0 for v in volumes[-5:]): return {}
 
         ema9 = calc_ema(closes, 9); ema21 = calc_ema(closes, 21)
         ema50_1h = calc_ema(closes_1h, 50)
-        rsi = calc_rsi(closes); rsi_prev = calc_rsi(closes[:-2])
-        rsi_rising = rsi > rsi_prev; rsi_falling = rsi < rsi_prev
+        rsi = calc_rsi(closes); rsi_prev = calc_rsi(closes[:-2]); rsi_rising = rsi > rsi_prev
         bb_low, bb_mid, bb_high = calc_bb(closes)
-        atr = calc_atr(bars); avg_atr = calc_atr(bars[:-10]) if len(bars) > 15 else atr
-        adx = calc_adx(bars)
+        atr = calc_atr(bars_5m); avg_atr = calc_atr(bars_5m[:-10]) if len(bars_5m) > 15 else atr
         if not ema9 or not ema21 or not ema50_1h or bb_mid is None: return {}
 
         bb_bw = ((bb_high - bb_low) / bb_mid) * 100 if bb_mid > 0 else 0
         avg_vol = sum(volumes[-20:]) / 20; vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
         atr_ok = avg_atr == 0 or atr >= avg_atr * cfg["atr_min_mult"]
-        trending = adx >= cfg["adx_min"]
-        # FIX 2: longs require a stronger trend than shorts (higher ADX floor)
-        trending_long = adx >= cfg.get("adx_min_long", cfg["adx_min"])
-        # FIX 1: block EMA longs entirely when this pair is in a BEAR regime
-        long_allowed = not (cfg.get("block_long_in_bear", False) and regime == "BEAR")
+        sk = symbol.replace("/","")
 
-        # LONG score
-        long_score = 0
-        if long_allowed and rsi <= cfg["rsi_hard_gate"] and atr_ok and trending_long:
-            if price > ema50_1h[-1]: long_score += 1
-            if ema9[-1] > ema21[-1]: long_score += 2
-            if len(ema9) > 1 and ema9[-1] > ema21[-1] and ema9[-2] <= ema21[-2]: long_score += 1
-            if rsi < 40 and rsi_rising: long_score += 2
-            elif rsi < cfg["rsi_hard_gate"] and rsi_rising: long_score += 1
-            if bb_bw >= cfg["bb_min_bw"] and price < bb_low: long_score += 1
-            if vol_ratio >= cfg["volume_bonus_mult"]: long_score += 1
+        if rsi > cfg["rsi_hard_gate"]:
+            bot_state["signals"][sk]["EMA" if tf=="5Min" else "EMA_15m"] = {"price": price, "rsi": round(rsi,1), "blocked": "RSI_HIGH", "buy_score": 0, "strategy": "EMA"}
+            return bot_state["signals"][sk]["EMA"]
+        if not atr_ok:
+            bot_state["signals"][sk]["EMA" if tf=="5Min" else "EMA_15m"] = {"price": price, "blocked": "ATR_LOW", "buy_score": 0, "strategy": "EMA"}
+            return bot_state["signals"][sk]["EMA"]
 
-        # SHORT score — mirror of long
-        short_score = 0
-        if rsi >= (100 - cfg["rsi_hard_gate"]) and atr_ok and trending:
-            if price < ema50_1h[-1]: short_score += 1
-            if ema9[-1] < ema21[-1]: short_score += 2
-            if len(ema9) > 1 and ema9[-1] < ema21[-1] and ema9[-2] >= ema21[-2]: short_score += 1
-            if rsi > 60 and rsi_falling: short_score += 2
-            elif rsi > (100 - cfg["rsi_hard_gate"]) and rsi_falling: short_score += 1
-            if bb_bw >= cfg["bb_min_bw"] and price > bb_high: short_score += 1
-            if vol_ratio >= cfg["volume_bonus_mult"]: short_score += 1
+        confirmed = check_confirmation(symbol, "EMA", bars_5m[-1])
+        score = 0
+        if price > ema50_1h[-1]: score += 1
+        if ema9[-1] > ema21[-1]: score += 2
+        if len(ema9) > 1 and ema9[-1] > ema21[-1] and ema9[-2] <= ema21[-2]: score += 1
+        if rsi < 40 and rsi_rising: score += 2
+        elif rsi < cfg["rsi_hard_gate"] and rsi_rising: score += 1
+        if bb_bw >= cfg["bb_min_bw"] and price < bb_low: score += 1
+        if vol_ratio >= cfg["volume_bonus_mult"]: score += 1
 
-        sig = {"price": price, "rsi": round(rsi,1), "adx": round(adx,1),
-               "vol_ratio": round(vol_ratio,2), "trending": trending,
-               "long_score": long_score, "short_score": short_score, "strategy": "EMA"}
-        bot_state["signals"][symbol]["EMA" if tf=="M5" else "EMA_15m"] = sig
-        log.info(f"[EMA] {symbol} | price={price:.5f} RSI={round(rsi,1)} ADX={round(adx,1)} L={long_score} S={short_score}")
+        if score >= cfg["min_score"]:
+            confirmed = True
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
+            set_pending(symbol, "EMA", {"score": score})
+
+        sig = {"price": price, "rsi": round(rsi,1), "rsi_rising": rsi_rising,
+               "vol_ratio": round(vol_ratio,2), "buy_score": score, "confirmed": confirmed, "strategy": "EMA"}
+        bot_state["signals"][sk]["EMA" if tf=="5Min" else "EMA_15m"] = sig
+        log.info(f"[EMA] {symbol} | price={price} RSI={round(rsi,1)} score={score} conf={confirmed}")
         return sig
     except Exception as e: log.error(f"[EMA] error {symbol}: {e}"); return {}
 
-# ── STRATEGY B: MSS (LONG + SHORT) ────────────────────────────────────
-def run_mss(symbol, regime, tf="M5"):
+def run_mss(symbol, regime, tf="5Min"):
     cfg = MSS_CONFIG
     try:
-        bars = get_candles(symbol, tf, 80)
-        bars_1h = get_candles(symbol, "H1", 30)
-        if len(bars) < 20 or len(bars_1h) < 15: return {}
-        closes = [b["close"] for b in bars]
-        highs_1h = [b["high"] for b in bars_1h]; lows_1h = [b["low"] for b in bars_1h]
-        highs = [b["high"] for b in bars]; lows = [b["low"] for b in bars]
-        volumes = [b["volume"] for b in bars]; price = closes[-1]
+        bars_5m = get_bars(symbol, tf, 60); bars_1h = get_bars(symbol, "1Hour", 30)
+        if len(bars_5m) < 20 or len(bars_1h) < 15: return {}
+        closes = [b["close"] for b in bars_5m]; highs_1h = [b["high"] for b in bars_1h]
+        lows_1h = [b["low"] for b in bars_1h]; lows_5m = [b["low"] for b in bars_5m]
+        volumes = [b["volume"] for b in bars_5m]; price = closes[-1]
         if all(v == 0 for v in volumes[-5:]): return {}
 
-        rsi = calc_rsi(closes); rsi_prev = calc_rsi(closes[:-2])
-        rsi_rising = rsi > rsi_prev; rsi_falling = rsi < rsi_prev
-        atr = calc_atr(bars); avg_atr = calc_atr(bars[:-10]) if len(bars) > 15 else atr
+        rsi = calc_rsi(closes); rsi_prev = calc_rsi(closes[:-2]); rsi_rising = rsi > rsi_prev
+        atr = calc_atr(bars_5m); avg_atr = calc_atr(bars_5m[:-10]) if len(bars_5m) > 15 else atr
         avg_vol = sum(volumes[-20:]) / 20; vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
-        atr_ok = avg_atr == 0 or atr >= avg_atr * cfg["atr_min_mult"]
-        adx = calc_adx(bars); trending = adx >= cfg["adx_min"]
+        sk = symbol.replace("/","")
 
         rh = highs_1h[-5:]; ph = highs_1h[-10:-5]; rl = lows_1h[-5:]; pl = lows_1h[-10:-5]
         trend_1h = "NEUTRAL"
@@ -417,44 +428,44 @@ def run_mss(symbol, regime, tf="M5"):
             if max(rh) > max(ph) and min(rl) > min(pl): trend_1h = "BULL"
             elif max(rh) < max(ph) and min(rl) < min(pl): trend_1h = "BEAR"
 
-        lookback = cfg["swing_lookback"]
+        if trend_1h != "BULL":
+            bot_state["signals"][sk]["MSS" if tf=="5Min" else "MSS_15m"] = {"price": price, "trend_1h": trend_1h, "buy_score": 0, "strategy": "MSS"}
+            return bot_state["signals"][sk]["MSS"]
+
         last_sig = bot_state["mss_last_signal_time"].get(symbol)
+        lookback = cfg["swing_lookback"]
         if last_sig:
             hrs = (datetime.now(timezone.utc) - last_sig).total_seconds() / 3600
             if hrs > cfg["fallback_hours"]: lookback = cfg["swing_fallback"]
 
-        recent_lows = lows[-lookback:]; recent_highs = highs[-lookback:]
-        bull_mss = len(recent_lows) >= 5 and recent_lows[-3] < recent_lows[-5] and recent_lows[-1] > recent_lows[-2]
-        bear_mss = len(recent_highs) >= 5 and recent_highs[-3] > recent_highs[-5] and recent_highs[-1] < recent_highs[-2]
+        recent_lows = lows_5m[-lookback:]
+        mss = len(recent_lows) >= 5 and recent_lows[-3] < recent_lows[-5] and recent_lows[-1] > recent_lows[-2]
+        if mss: bot_state["mss_last_signal_time"][symbol] = datetime.now(timezone.utc)
 
-        if bull_mss or bear_mss:
-            bot_state["mss_last_signal_time"][symbol] = datetime.now(timezone.utc)
+        confirmed = check_confirmation(symbol, "MSS", bars_5m[-1])
+        score = 0
+        if mss: score += 3
+        if rsi < cfg["rsi_soft_threshold"] and rsi_rising: score += 2
+        elif rsi < cfg["rsi_soft_threshold"]: score += 1
+        if vol_ratio >= cfg["volume_bonus_mult"]: score += 1
 
-        long_score = 0
-        if bull_mss and trend_1h == "BULL" and trending:
-            long_score += 3
-            if rsi < cfg["rsi_soft_threshold"] and rsi_rising: long_score += 2
-            if vol_ratio >= cfg["volume_bonus_mult"]: long_score += 1
+        if score >= cfg["min_score"]:
+            confirmed = True
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
+            set_pending(symbol, "MSS", {"score": score})
 
-        short_score = 0
-        if bear_mss and trend_1h == "BEAR" and trending:
-            short_score += 3
-            if rsi > (100 - cfg["rsi_soft_threshold"]) and rsi_falling: short_score += 2
-            if vol_ratio >= cfg["volume_bonus_mult"]: short_score += 1
-
-        sig = {"price": price, "trend_1h": trend_1h, "adx": round(adx,1), "trending": trending,
-               "bull_mss": bull_mss, "bear_mss": bear_mss, "rsi": round(rsi,1),
-               "long_score": long_score, "short_score": short_score, "strategy": "MSS"}
-        bot_state["signals"][symbol]["MSS" if tf=="M5" else "MSS_15m"] = sig
-        log.info(f"[MSS] {symbol} | trend={trend_1h} ADX={round(adx,1)} bullMSS={bull_mss} bearMSS={bear_mss} L={long_score} S={short_score}")
+        sig = {"price": price, "trend_1h": trend_1h, "mss_detected": mss, "rsi": round(rsi,1),
+               "rsi_rising": rsi_rising, "vol_ratio": round(vol_ratio,2),
+               "buy_score": score, "confirmed": confirmed, "strategy": "MSS"}
+        bot_state["signals"][sk]["MSS" if tf=="5Min" else "MSS_15m"] = sig
+        log.info(f"[MSS] {symbol} | trend={trend_1h} MSS={mss} score={score} conf={confirmed}")
         return sig
     except Exception as e: log.error(f"[MSS] error {symbol}: {e}"); return {}
 
-# ── STRATEGY C: VPA (LONG + SHORT) ────────────────────────────────────
-def run_vpa(symbol, regime, tf="M5"):
+def run_vpa(symbol, regime, tf="5Min"):
     cfg = VPA_CONFIG
     try:
-        bars = get_candles(symbol, tf, 40)
+        bars = get_bars(symbol, tf, 40)
         if len(bars) < 25: return {}
         volumes = [b["volume"] for b in bars]; closes = [b["close"] for b in bars]
         opens = [b["open"] for b in bars]; highs = [b["high"] for b in bars]; lows = [b["low"] for b in bars]
@@ -466,360 +477,309 @@ def run_vpa(symbol, regime, tf="M5"):
         if bar_range == 0: return {}
         close_ratio = (closes[-1] - lows[-1]) / bar_range
         price_move = bar_range / price if price > 0 else 0
-        adx = calc_adx(bars); trending = adx >= cfg["adx_min"]
+        sk = symbol.replace("/","")
+
+        confirmed = check_confirmation(symbol, "VPA", bars[-1])
+        score = 0; signals_detected = []
+        if vol_ratio >= cfg["volume_spike_mult"]:
+            if close_ratio >= cfg["min_close_ratio"]: score += 2; signals_detected.append("VOL_SPIKE_BULL")
+        if vol_ratio >= 2.5 and price_move < cfg["effort_result_ratio"]:
+            if closes[-1] > opens[-1]: score += 2; signals_detected.append("ABSORPTION_BULL")
+        if vol_ratio < 0.7 and closes[-1] > opens[-1] and close_ratio > 0.5:
+            # FIX: NO_SUPPLY only counts when combined with a real volume signal
+            # By itself it's noise — fires constantly on every coin
+            if len(signals_detected) > 0:  # Only add if VOL_SPIKE or ABSORPTION already detected
+                score += 1; signals_detected.append("NO_SUPPLY")
         ema20 = calc_ema(closes, 20)
+        if ema20 and price > ema20[-1]: score += 1
 
-        long_score = 0; short_score = 0
-        long_sigs = []; short_sigs = []
+        # FIX: score 5 in bear regime = institutional distribution, not accumulation — cap it
+        raw_score = score
+        if regime == "BEAR" and score > cfg["bear_score_cap"]:
+            score = cfg["bear_score_cap"]
+            signals_detected.append("BEAR_CAPPED")
 
-        if trending:
-            # Bullish signals
-            if vol_ratio >= cfg["volume_spike_mult"] and close_ratio >= cfg["min_close_ratio"]:
-                long_score += 2; long_sigs.append("VOL_SPIKE_BULL")
-            if vol_ratio >= 2.5 and price_move < cfg["effort_result_ratio"] and closes[-1] > opens[-1]:
-                long_score += 2; long_sigs.append("ABSORPTION_BULL")
-            if vol_ratio < 0.7 and closes[-1] > opens[-1] and close_ratio > 0.5 and len(long_sigs) > 0:
-                long_score += 1; long_sigs.append("NO_SUPPLY")
-            if ema20 and price > ema20[-1]: long_score += 1
+        # FIX: score 4+ enters immediately, skip confirmation requirement entirely
+        if score >= cfg["min_score"]:
+            confirmed = True  # treat as confirmed — high score doesn't need candle confirmation
+        elif score >= cfg["min_score_confirmed"] and not confirmed:
+            set_pending(symbol, "VPA", {"score": score})
 
-            # Bearish signals — MIRROR
-            if vol_ratio >= cfg["volume_spike_mult"] and close_ratio <= (1 - cfg["min_close_ratio"]):
-                short_score += 2; short_sigs.append("VOL_SPIKE_BEAR")
-            if vol_ratio >= 2.5 and price_move < cfg["effort_result_ratio"] and closes[-1] < opens[-1]:
-                short_score += 2; short_sigs.append("ABSORPTION_BEAR")
-            if vol_ratio < 0.7 and closes[-1] < opens[-1] and close_ratio < 0.5 and len(short_sigs) > 0:
-                short_score += 1; short_sigs.append("NO_DEMAND")
-            if ema20 and price < ema20[-1]: short_score += 1
-
-        # Bear regime cap
-        if regime == "BEAR" and long_score > cfg["bear_score_cap"]: long_score = cfg["bear_score_cap"]
-        if regime == "BULL" and short_score > cfg["bear_score_cap"]: short_score = cfg["bear_score_cap"]
-
-        sig = {"price": price, "vol_ratio": round(vol_ratio,2), "adx": round(adx,1),
-               "trending": trending, "close_ratio": round(close_ratio,2),
-               "long_score": long_score, "short_score": short_score,
-               "long_sigs": long_sigs, "short_sigs": short_sigs, "strategy": "VPA"}
-        bot_state["signals"][symbol]["VPA" if tf=="M5" else "VPA_15m"] = sig
-        log.info(f"[VPA] {symbol} | vol={round(vol_ratio,2)}x ADX={round(adx,1)} L={long_score} S={short_score} sigs={long_sigs+short_sigs}")
+        sig = {"price": price, "vol_ratio": round(vol_ratio,2), "close_ratio": round(close_ratio,2),
+               "buy_score": score, "raw_score": raw_score, "signals": signals_detected, "confirmed": confirmed, "strategy": "VPA"}
+        bot_state["signals"][sk]["VPA" if tf=="5Min" else "VPA_15m"] = sig
+        log.info(f"[VPA] {symbol} | vol={round(vol_ratio,2)}x score={score} sigs={signals_detected} conf={confirmed}")
         return sig
     except Exception as e: log.error(f"[VPA] error {symbol}: {e}"); return {}
 
-# ── STRATEGY D: BREAKOUT (LONG + SHORT) ────────────────────────────────
-def run_breakout(symbol, regime, tf="M5"):
+def is_session_window():
+    """Returns True if within 30min of Tokyo/London/NY open — real volume windows"""
+    now = datetime.now(timezone.utc)
+    h = now.hour + now.minute/60
+    for start, end in SESSION_WINDOWS_UTC:
+        if start <= h < end:
+            return True
+    return False
+
+def is_weekend_gap_window():
+    """Sunday 00:00-01:00 UTC — right after the weekly low-liquidity weekend period,
+    comparing Friday 21:00 UTC close to current price"""
+    now = datetime.now(timezone.utc)
+    return now.weekday() == 6 and now.hour < 1  # Sunday, first hour
+
+def run_weekend_gap(symbol, regime):
+    """5th strategy — crypto's equivalent of ETF's Gap detector.
+    Compares Friday 9PM UTC (5PM ET, when TradFi closes) price to Sunday open price."""
+    cfg = GAP_CONFIG
+    try:
+        if not is_weekend_gap_window():
+            return {}
+        sk = symbol.replace("/","")
+        week_key = datetime.now(timezone.utc).strftime("%Y-W%U")
+        if bot_state["gap_fired_this_week"].get(sk) == week_key:
+            return {}
+
+        bars = get_bars(symbol, "1Hour", 72)  # 3 days back to find Friday close
+        if len(bars) < 10: return {}
+
+        # Find the bar closest to Friday 21:00 UTC
+        friday_close = None
+        for b in bars:
+            try:
+                bt = datetime.fromisoformat(b["time"].replace("Z","+00:00"))
+                if bt.weekday() == 4 and bt.hour >= 20:
+                    friday_close = b["close"]
+            except: continue
+        if not friday_close:
+            friday_close = bars[-24]["close"] if len(bars) >= 24 else bars[0]["close"]
+
+        current_price = bars[-1]["close"]
+        volumes = [b["volume"] for b in bars[-24:]]
+        avg_vol = sum(volumes) / len(volumes) if volumes else 1
+        curr_vol = bars[-1]["volume"]
+        vol_ratio = curr_vol / avg_vol if avg_vol > 0 else 0
+
+        gap_pct = (current_price - friday_close) / friday_close * 100
+        is_gap_up = cfg["min_gap_pct"] <= gap_pct <= cfg["max_gap_pct"]
+        vol_ok = vol_ratio >= cfg["volume_confirm_mult"]
+
+        score = 5 if (is_gap_up and vol_ok) else 0
+        sig = {"price": current_price, "friday_close": round(friday_close,4),
+               "gap_pct": round(gap_pct,2), "vol_ratio": round(vol_ratio,2),
+               "is_gap_up": is_gap_up, "buy_score": score, "confirmed": True,
+               "strategy": "Gap"}
+        bot_state["signals"][sk]["Gap"] = sig
+        if score > 0:
+            log.info(f"[Gap] {symbol} | weekend gap {round(gap_pct,2)}% vol={round(vol_ratio,1)}x SCORE={score}")
+        return sig
+    except Exception as e:
+        log.error(f"[Gap] error {symbol}: {e}"); return {}
+
+def run_breakout(symbol, regime, tf="5Min"):
     cfg = BREAKOUT_CONFIG
     try:
-        bars = get_candles(symbol, tf, 40)
-        if len(bars) < 12: return {}
+        bars = get_bars(symbol, tf, 40)
+        if len(bars) < 15: return {}
         closes = [b["close"] for b in bars]; highs = [b["high"] for b in bars]
         lows = [b["low"] for b in bars]; volumes = [b["volume"] for b in bars]
+        opens = [b["open"] for b in bars]
         if all(v == 0 for v in volumes[-5:]): return {}
 
-        price = closes[-1]; pv = pip_value(symbol)
-        avg_vol = sum(volumes[-20:]) / len(volumes[-20:]) if volumes[-20:] else 1
-        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
-        adx = calc_adx(bars); trending = adx >= cfg["adx_min"]
+        price = closes[-1]; curr_close = closes[-1]; curr_open = opens[-1]
+        avg_vol = sum(volumes[-20:]) / 20; vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
+        candle_pct = abs(curr_close - curr_open) / curr_open * 100 if curr_open > 0 else 0
+        sk = symbol.replace("/","")
+
+        # Momentum override — lowered to 1.5%, further reduced during session opens (real volume windows)
+        session_active = is_session_window()
+        momentum_threshold = cfg["momentum_override_pct"] * 0.7 if session_active else cfg["momentum_override_pct"]
+        momentum_override = (candle_pct >= momentum_threshold and
+                            vol_ratio >= cfg["momentum_override_volume"] and curr_close > curr_open)
 
         lookback = cfg["consolidation_candles"]
+        if len(bars) < lookback + 2: return {}
         consol = bars[-(lookback+2):-2]
         c_highs = [b["high"] for b in consol]; c_lows = [b["low"] for b in consol]
-        c_range_pips = pips(symbol, max(c_highs) - min(c_lows))
-        c_high = max(c_highs); c_low = min(c_lows)
-        in_consol = c_range_pips <= cfg["consolidation_pips"]
+        c_range_pct = (max(c_highs) - min(c_lows)) / price * 100 if price > 0 else 0
+        c_high = max(c_highs); in_consol = c_range_pct <= cfg["consolidation_threshold"]
 
         bar_range = highs[-1] - lows[-1]
         close_ratio = (closes[-1] - lows[-1]) / bar_range if bar_range > 0 else 0
+        bo_pct = (closes[-1] - c_high) / c_high * 100 if c_high > 0 else 0
 
-        # Bull breakout
-        bo_pips_up = pips(symbol, closes[-1] - c_high)
         prev = bars[-2]; prev_range = prev["high"] - prev["low"]
-        prev_bull = False; prev_bear = False
-        if prev_range > 0:
-            pcr = (prev["close"] - prev["low"]) / prev_range
-            prev_bull = prev["close"] > c_high and pcr >= 0.5
-            prev_bear = prev["close"] < c_low and pcr <= 0.5
+        prev_confirmed = False
+        if prev_range > 0: prev_confirmed = prev["close"] > c_high and (prev["close"] - prev["low"]) / prev_range >= 0.5
 
-        bull_breakout = (in_consol and closes[-1] > c_high and bo_pips_up >= cfg["min_breakout_pips"]
-                        and vol_ratio >= cfg["breakout_volume_mult"]
-                        and close_ratio >= cfg["breakout_candle_close_ratio"] and prev_bull and trending)
+        is_breakout = (in_consol and closes[-1] > c_high and bo_pct >= cfg["min_breakout_pct"] and
+                      vol_ratio >= cfg["breakout_volume_mult"] and close_ratio >= cfg["breakout_candle_close_ratio"] and
+                      prev_confirmed)
 
-        # Bear breakdown — MIRROR
-        bo_pips_down = pips(symbol, c_low - closes[-1])
-        bear_breakout = (in_consol and closes[-1] < c_low and bo_pips_down >= cfg["min_breakout_pips"]
-                        and vol_ratio >= cfg["breakout_volume_mult"]
-                        and close_ratio <= (1 - cfg["breakout_candle_close_ratio"]) and prev_bear and trending)
+        confirmed = check_confirmation(symbol, "Breakout", bars[-1])
+        buy_signal = momentum_override or is_breakout
+        score = 5 if momentum_override else (4 if is_breakout else 0)
 
-        long_score = 4 if bull_breakout else 0
-        short_score = 4 if bear_breakout else 0
-
-        sig = {"price": price, "vol_ratio": round(vol_ratio,2), "adx": round(adx,1),
-               "trending": trending, "consol_pips": round(c_range_pips,1),
-               "bull_breakout": bull_breakout, "bear_breakout": bear_breakout,
-               "long_score": long_score, "short_score": short_score, "strategy": "Breakout"}
-        bot_state["signals"][symbol]["Breakout" if tf=="M5" else "Breakout_15m"] = sig
-        log.info(f"[Breakout] {symbol} | ADX={round(adx,1)} consol={round(c_range_pips,1)}p bullBO={bull_breakout} bearBO={bear_breakout}")
+        sig = {"price": price, "vol_ratio": round(vol_ratio,2), "candle_pct": round(candle_pct,2),
+               "consol_pct": round(c_range_pct,2), "is_breakout": is_breakout,
+               "momentum_override": momentum_override, "buy_signal": buy_signal,
+               "session_active": session_active, "buy_score": score,
+               "confirmed": confirmed, "strategy": "Breakout"}
+        bot_state["signals"][sk]["Breakout" if tf=="5Min" else "Breakout_15m"] = sig
+        log.info(f"[Breakout] {symbol} | vol={round(vol_ratio,1)}x candle={round(candle_pct,2)}% breakout={is_breakout} momentum={momentum_override}")
         return sig
     except Exception as e: log.error(f"[Breakout] error {symbol}: {e}"); return {}
 
-def run_sweep(symbol, regime, tf="M5"):
-    """Liquidity Sweep Reversal (Smart Money Concept).
-    Detects when price spikes PAST a recent swing high/low (grabbing stop-order
-    liquidity) then FAILS and closes back on the other side — a reversal signal.
-
-    Bullish sweep: price wicks below a recent swing low, then closes back above it
-                   → stops below the low got run, buyers step in → LONG
-    Bearish sweep: price wicks above a recent swing high, then closes back below it
-                   → stops above the high got run, sellers step in → SHORT
-
-    Deliberately does NOT use an ADX trend filter — this trades reversals, not trends.
-    """
-    cfg = SWEEP_CONFIG
-    try:
-        bars = get_candles(symbol, tf, 40)
-        if len(bars) < cfg["swing_lookback"] + 3: return {}
-        closes = [b["close"] for b in bars]; highs = [b["high"] for b in bars]
-        lows = [b["low"] for b in bars]; opens = [b["open"] for b in bars]
-        volumes = [b["volume"] for b in bars]
-        if all(v == 0 for v in volumes[-5:]): return {}
-
-        price = closes[-1]; pv = pip_value(symbol)
-        avg_vol = sum(volumes[-20:]) / len(volumes[-20:]) if volumes[-20:] else 1
-        vol_ratio = volumes[-1] / avg_vol if avg_vol > 0 else 0
-
-        # Find the swing high/low over the lookback window, EXCLUDING the last 2 bars
-        # (the sweep itself is the last bar, so we look at the range it swept into)
-        window = bars[-(cfg["swing_lookback"]+2):-2]
-        swing_high = max(b["high"] for b in window)
-        swing_low  = min(b["low"] for b in window)
-
-        cur = bars[-1]
-        cur_high = cur["high"]; cur_low = cur["low"]
-        cur_close = cur["close"]; cur_open = cur["open"]
-        bar_range = cur_high - cur_low
-        if bar_range == 0: return {}
-        close_ratio = (cur_close - cur_low) / bar_range
-
-        # BULLISH SWEEP: wick pierced below swing low, but closed back ABOVE it
-        swept_low_pips = pips(symbol, swing_low - cur_low)   # how far below the low we poked
-        bull_sweep = (cur_low < swing_low                                   # wicked below
-                      and cur_close > swing_low                             # closed back above
-                      and cfg["min_sweep_pips"] <= swept_low_pips <= cfg["max_sweep_pips"]
-                      and close_ratio >= 0.5                                # closed in upper half
-                      and vol_ratio >= cfg["volume_mult"])                  # elevated volume (stop run)
-
-        # BEARISH SWEEP: wick pierced above swing high, but closed back BELOW it
-        swept_high_pips = pips(symbol, cur_high - swing_high)
-        bear_sweep = (cur_high > swing_high                                 # wicked above
-                      and cur_close < swing_high                            # closed back below
-                      and cfg["min_sweep_pips"] <= swept_high_pips <= cfg["max_sweep_pips"]
-                      and close_ratio <= 0.5                                # closed in lower half
-                      and vol_ratio >= cfg["volume_mult"])
-
-        long_score = 4 if bull_sweep else 0
-        short_score = 4 if bear_sweep else 0
-
-        sig = {"price": price, "vol_ratio": round(vol_ratio,2),
-               "swing_high": round(swing_high,5), "swing_low": round(swing_low,5),
-               "bull_sweep": bull_sweep, "bear_sweep": bear_sweep,
-               "long_score": long_score, "short_score": short_score, "strategy": "Sweep"}
-        bot_state["signals"][symbol]["Sweep" if tf=="M5" else "Sweep_15m"] = sig
-        if bull_sweep or bear_sweep:
-            log.info(f"[Sweep] {symbol} | bullSweep={bull_sweep} bearSweep={bear_sweep} vol={round(vol_ratio,1)}x")
-        return sig
-    except Exception as e: log.error(f"[Sweep] error {symbol}: {e}"); return {}
-
 # ── EXIT / ENTRY ───────────────────────────────────────────────────────
-def check_exits(symbol, now):
+def check_exits(symbol, price, now):
     pos = bot_state["positions"].get(symbol)
     if not pos: return
-    entry = pos["entry"]; units = pos["units"]; strategy = pos.get("strategy", "UNKNOWN")
-    trade_id = pos.get("trade_id", ""); side = pos.get("side", "long")
-    bars = get_candles(symbol, "M5", 3)
-    if not bars: return
-    price = bars[-1]["close"]
-
-    if side == "long":
-        pnl_pips = (price - entry) / pip_value(symbol)
-    else:
-        pnl_pips = (entry - price) / pip_value(symbol)
-
+    entry = pos["entry"]; qty = pos["qty"]; strategy = pos.get("strategy", "UNKNOWN")
+    pct = (price - entry) / entry * 100
+    # NOTE: Alpaca crypto does NOT support server-side bracket orders (equities only).
+    # We mitigate SL-overshoot risk with a catastrophic-stop check below that closes
+    # immediately on any check where price has gapped well past the intended SL.
     should_exit = False; reason = ""
-    if pnl_pips >= RISK["take_profit_pips"]:
-        should_exit = True; reason = f"Take profit (+{round(pnl_pips,1)}p)"
-    elif pnl_pips <= -RISK["stop_loss_pips"]:
-        should_exit = True; reason = f"Stop loss ({round(pnl_pips,1)}p)"
-        bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
 
+    # FIX: 30-minute time exit — cut losers early, they rarely recover (data confirmed)
+    open_time = pos.get("open_time")
+    minutes_open = 0
+    if open_time:
+        minutes_open = (now - datetime.fromisoformat(open_time)).total_seconds() / 60
+
+    if pct >= RISK["take_profit_pct"]: should_exit = True; reason = f"Take profit (+{round(pct,2)}%)"
+    elif pct <= -RISK["stop_loss_pct"]:
+        should_exit = True; reason = f"Stop loss ({round(pct,2)}%)"
+        bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
+        # Catastrophic stop: if price gapped way past SL (2x the intended), flag it
+        if pct <= -(RISK["stop_loss_pct"] * 2):
+            log.warning(f"CATASTROPHIC STOP {symbol}: {round(pct,2)}% — gapped past SL, closing immediately")
+    elif minutes_open >= RISK["time_exit_minutes"] and pct < 0:
+        should_exit = True; reason = f"30min time exit ({round(pct,2)}%)"
+        bot_state["active_cooldowns"][f"{strategy}_{symbol}"] = now.isoformat()
     if should_exit:
-        exit_price = close_position(symbol, trade_id)
-        if exit_price:
-            if side == "long":
-                pnl = calc_pnl(symbol, entry, exit_price, units)
-            else:
-                pnl = calc_pnl(symbol, exit_price, entry, units)
-            win = pnl > 0
-            record_exit(symbol, strategy, side, pnl, win)
-            side_label = "LONG" if side == "long" else "SHORT"
-            add_diary(symbol,
-                f"{'WIN' if win else 'LOSS'} [{side_label}] | {entry:.5f}→{exit_price:.5f} | "
-                f"{round(pnl_pips,1)}p | ${round(pnl,2)} | {reason}",
+        if close_position_alpaca(symbol):
+            pnl = (price - entry) * qty; win = pnl > 0
+            record_exit(symbol, strategy, pnl, win)
+            add_diary(symbol, f"{'WIN' if win else 'LOSS'} | ${entry:,.4f}→${price:,.4f} | ${round(pnl,2)} ({round(pct,2)}%) | {reason}",
                 "win" if win else "loss", strategy)
-            bot_state["closed_trades"].append({"symbol": symbol, "side": side,
-                "entry": entry, "exit": exit_price, "pnl": round(pnl,2),
-                "pips": round(pnl_pips,1), "win": win, "strategy": strategy,
+            bot_state["closed_trades"].append({"symbol": symbol, "entry": entry, "exit": price,
+                "pnl": round(pnl,2), "pct": round(pct,2), "win": win, "strategy": strategy,
                 "reason": reason, "time": now.strftime("%H:%M")})
             sync_positions()
 
-def try_entry(symbol, strategy, sig, regime, side, now):
-    if not can_enter(symbol, strategy, side): return
-    if not is_trading_window({"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG,
-                              "Breakout": BREAKOUT_CONFIG}.get(strategy, {})): return
+def try_entry(symbol, strategy, sig, regime, now):
+    if not can_enter(symbol, strategy): return
+    sk = symbol.replace("/","")
+    sym_regime = bot_state["symbol_regimes"].get(sk, "UNKNOWN")
+    confirmed = sig.get("confirmed", False)
+    cfg_map = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG}
+    cfg = cfg_map.get(strategy, {})
 
-    score_key = "long_score" if side == "BUY" else "short_score"
-    score = sig.get(score_key, 0)
-    cfg = {"EMA": EMA_CONFIG, "MSS": MSS_CONFIG, "VPA": VPA_CONFIG, "Breakout": BREAKOUT_CONFIG, "Sweep": SWEEP_CONFIG}.get(strategy, {})
-    regime = bot_state["market_regime"].get(symbol, "UNKNOWN")
+    if strategy == "EMA":
+        if sym_regime == "BEAR" and cfg.get("bear_filter"): return
+        if not is_in_time_window(cfg): return
+        if sig.get("blocked"): return
+    elif strategy == "MSS":
+        if not sig.get("mss_detected"): return
+        if sym_regime == "BEAR" and cfg.get("bear_filter"): return
+        if not is_in_time_window(cfg): return
+    elif strategy == "VPA":
+        # FIX: VPA DISABLED in bear regime — 0% win rate over 100+ trades in bear market
+        # Volume signals are unreliable when the overall trend is down
+        # VPA only activates when per-symbol regime is BULL or UNKNOWN
+        if sym_regime == "BEAR":
+            return
+    elif strategy == "Breakout":
+        if not sig.get("buy_signal") and not confirmed: return
+        if sym_regime == "BEAR" and not sig.get("momentum_override"): return
 
-    # FIX: Asymmetric thresholds — favor the trend direction
-    # BEAR: shorts need 3, longs need 5 (shorts are with the trend)
-    # BULL: longs need 3, shorts need 5 (longs are with the trend)
-    # EXCEPTION: Sweep is a REVERSAL strategy by design — it deliberately trades
-    # counter-trend liquidity grabs, so it uses a flat threshold of 4 both directions.
-    # Applying the asymmetric trend filter would block the exact setups it exists to catch.
-    if strategy == "Sweep":
-        min_score = cfg.get("min_score", 4)
-    elif regime == "BEAR":
-        min_score = 3 if side == "SELL" else 5
-    elif regime == "BULL":
-        min_score = 3 if side == "BUY" else 5
-    else:
-        min_score = cfg.get("min_score", 4)
+    min_score = cfg.get("min_score_confirmed", 3) if confirmed else cfg.get("min_score", 4)
+    if sig.get("buy_score", 0) < min_score: return
 
-    if score < min_score:
-        return
+    cash = bot_state["account_cash"]; budget = cash * RISK["position_size"]
+    price = sig["price"]; qty = budget / price
+    if budget < 10 or qty <= 0: return
 
-    order_side = side
-    # FIX: Reduce position size when trading against the trend
-    regime = bot_state["market_regime"].get(symbol, "UNKNOWN")
-    with_trend = (regime == "BEAR" and side == "SELL") or (regime == "BULL" and side == "BUY")
-    units = RISK["position_units"] if with_trend else RISK.get("counter_trend_units", 2500)
-
-    # Calculate TP and SL prices for server-side execution
-    pv = pip_value(symbol)
-    if side == "BUY":
-        tp_price = None  # Will be set after we know entry price
-        sl_price = None
-    else:
-        tp_price = None
-        sl_price = None
-
-    entry_price = place_order(symbol, units, order_side)
-    if entry_price:
-        pv = pip_value(symbol)
-        precision = 3 if "JPY" in symbol else 5
-        if side == "BUY":
-            tp = round(entry_price + RISK["take_profit_pips"] * pv, precision)
-            sl = round(entry_price - RISK["stop_loss_pips"] * pv, precision)
-        else:
-            tp = round(entry_price - RISK["take_profit_pips"] * pv, precision)
-            sl = round(entry_price + RISK["stop_loss_pips"] * pv, precision)
-
-        # Set server-side SL/TP on the open trade
-        try:
-            sync_positions()
-            pos = bot_state["positions"].get(symbol, {})
-            trade_id = pos.get("trade_id", "")
-            if trade_id and trade_id != "pending":
-                import oandapyV20.endpoints.trades as trades_ep
-                client = get_oanda_client()
-                sl_tp_data = {
-                    "stopLoss": {"price": str(round(sl, precision))},
-                    "takeProfit": {"price": str(round(tp, precision))}
-                }
-                trades_ep.TradeCRCDO(OANDA_ACCOUNT_ID, trade_id, sl_tp_data)
-                log.info(f"Server-side SL/TP set: SL={sl} TP={tp}")
-        except Exception as e:
-            log.error(f"SL/TP set error: {e}")
-
-        side_word = "long" if side == "BUY" else "short"
-        bot_state["positions"][symbol] = {"symbol": symbol, "entry": entry_price,
-            "units": units, "side": side_word, "trade_id": "pending",
-            "open_time": now.isoformat(), "current_price": entry_price,
-            "unrealized_pnl": 0, "strategy": strategy}
+    order = place_order(symbol, qty, "BUY")
+    if order:
+        bot_state["positions"][symbol] = {"symbol": symbol, "entry": price, "qty": qty,
+            "current_price": price, "unrealized_pnl": 0,
+            "open_time": now.isoformat(), "strategy": strategy}
         bot_state["strategy_positions"][strategy].append(symbol)
         sync_positions()
-        side_label = "BUY" if side == "BUY" else "SHORT"
-        add_diary(symbol,
-            f"{side_label} | {entry_price:.5f} | Score {score} | "
-            f"TP {tp} | SL {sl} | ADX {sig.get('adx', 0)}",
-            "trade", strategy)
-        log.info(f"[{strategy}] {side_label} {symbol} at {entry_price} | score={score} | ADX={sig.get('adx',0)}")
+        conf_label = " ✓CONF" if confirmed else ""
+        add_diary(symbol, f"BUY | ${price:,.4f} | Score {sig.get('buy_score',0)}{conf_label}", "trade", strategy)
+        log.info(f"[{strategy}] ENTERED {symbol} at {price}{conf_label}")
 
 # ── TRADING LOOP ───────────────────────────────────────────────────────
 def trading_loop():
-    if not OANDA_API_KEY or not OANDA_ACCOUNT_ID:
-        log.warning("No OANDA credentials"); return
+    if not API_KEY or not API_SECRET:
+        log.warning("No Alpaca credentials"); return
 
     add_diary("SYSTEM",
-        "ForexAI v8.2 started (+EMA long filters: no bear longs, ADX>=25) | LONG + SHORT enabled | "
-        "ADX trend filter | 7 Pairs | 4 Strategies | "
-        "M5+M15 scanning | No time exit",
-        "system")
-    log.info("ForexAI Combined Bot v8.2 started")
-    send_telegram("🚀 <b>Forex Bot v7.0 started</b>\nLONG + SHORT enabled | ADX filter | 7 pairs")
+        "Combined Crypto v5.0 started | 5 Strategies | 8 Coins (-AVAX -UNI) | "
+        "VPA DISABLED in bear regime | NO_SUPPLY standalone removed | "
+        "VPA 2hr cooldown | 60min time exit | "
+        "3-loss 6hr lockout | EMA+MSS priority over VPA", "system")
+    log.info("Combined Crypto Bot v5.1 started")
+    send_telegram("🚀 <b>Crypto Bot v5.1 started</b>\n8 coins | ADX filter | 2% regime buffer")
 
     regime_check_time = None; daily_reset_date = None
-
     while True:
         try:
-            if not is_market_open():
-                bot_state["market_open"] = False; time.sleep(60); continue
-            bot_state["market_open"] = True
             now = datetime.now(timezone.utc)
             today = now.date()
             if daily_reset_date != today:
-                bot_state["day_pnl"] = 0.0; bot_state["daily_start_nav"] = 0.0
+                bot_state["day_pnl"] = 0.0; bot_state["daily_start_equity"] = 0.0
                 bot_state["daily_paused"] = False; daily_reset_date = today
 
-            get_account_info(); sync_positions()
-            bot_state["in_trading_window"] = any(
-                is_trading_window(c) for c in [EMA_CONFIG, MSS_CONFIG, VPA_CONFIG, BREAKOUT_CONFIG])
+            refresh_account(); sync_positions()
 
             if not regime_check_time or (now - regime_check_time).total_seconds() > 1800:
+                bot_state["market_regime"] = check_market_regime()
                 for sym in SYMBOLS:
-                    bot_state["market_regime"][sym] = check_symbol_regime(sym)
+                    bot_state["symbol_regimes"][sym.replace("/","")] = check_symbol_regime(sym)
                 regime_check_time = now
 
             # Daily loss check
-            if bot_state["daily_start_nav"] > 0:
-                loss_pct = (bot_state["daily_start_nav"] - bot_state["account_nav"]) / bot_state["daily_start_nav"] * 100
+            if bot_state["daily_start_equity"] > 0:
+                loss_pct = (bot_state["daily_start_equity"] - bot_state["account_equity"]) / bot_state["daily_start_equity"] * 100
                 if loss_pct >= RISK["daily_loss_limit_pct"] and not bot_state["daily_paused"]:
                     bot_state["daily_paused"] = True
-                    add_diary("SYSTEM", f"Daily loss limit hit", "system")
-            if bot_state["daily_paused"]: time.sleep(60); continue
+                    add_diary("SYSTEM", f"Daily loss limit {RISK['daily_loss_limit_pct']}% hit", "system")
+            if bot_state["daily_paused"] or bot_state["killed"]: time.sleep(60); continue
+
+            # Clear expired cooldowns
+            expired = [k for k, t in list(bot_state["active_cooldowns"].items())
+                       if (now - datetime.fromisoformat(t)).total_seconds() > RISK["cooldown_minutes"] * 60]
+            for k in expired: del bot_state["active_cooldowns"][k]
 
             for symbol in SYMBOLS:
                 if bot_state["killed"]: break
-                regime = bot_state["market_regime"].get(symbol, "UNKNOWN")
-                check_exits(symbol, now)
+                bars = get_bars(symbol, "5Min", 3)
+                if not bars: continue
+                price = bars[-1]["close"]
+                check_exits(symbol, price, now)
+                regime = bot_state["symbol_regimes"].get(symbol.replace("/",""), "UNKNOWN")
 
+                # Gap doesn't take a timeframe param
+                if len(bot_state["strategy_positions"]["Gap"]) < RISK["max_positions_per_strategy"]:
+                    sig = run_weekend_gap(symbol, regime)
+                    if sig: try_entry(symbol, "Gap", sig, regime, now)
+
+                # FIX 7: Reordered — EMA and MSS get priority over VPA
+                # Gap > Breakout > EMA > MSS > VPA (VPA is last — fills remaining slots only)
                 for strat, run_fn in [("Breakout", run_breakout), ("EMA", run_ema),
-                                      ("MSS", run_mss), ("VPA", run_vpa), ("Sweep", run_sweep)]:
+                                      ("MSS", run_mss), ("VPA", run_vpa)]:
                     if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
-                        for tf in ["M5", "M15"]:
-                            sig = run_fn(symbol, regime, tf)
-                            if not sig: continue
-                            # Try LONG
-                            if sig.get("long_score", 0) >= 4:
-                                try_entry(symbol, strat, sig, regime, "BUY", now)
-                            # Try SHORT
-                            if sig.get("short_score", 0) >= 4:
-                                try_entry(symbol, strat, sig, regime, "SELL", now)
-                            if len(bot_state["strategy_positions"][strat]) >= RISK["max_positions_per_strategy"]:
-                                break
+                        sig_5m = run_fn(symbol, regime, "5Min")
+                        if sig_5m: try_entry(symbol, strat, sig_5m, regime, now)
+                    if len(bot_state["strategy_positions"][strat]) < RISK["max_positions_per_strategy"]:
+                        sig_15m = run_fn(symbol, regime, "15Min")
+                        if sig_15m: try_entry(symbol, strat, sig_15m, regime, now)
 
         except Exception as e:
-            log.error(f"Loop error: {e}")
-            import traceback; log.error(traceback.format_exc())
+            log.error(f"Loop error: {e}"); import traceback; log.error(traceback.format_exc())
         time.sleep(60)
 
 threading.Thread(target=trading_loop, daemon=True).start()
@@ -829,34 +789,33 @@ threading.Thread(target=trading_loop, daemon=True).start()
 def no_cache(r):
     r.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"; return r
 
-def clean_val(obj):
+def clean_nan(obj):
     if isinstance(obj, float): return 0.0 if (math.isnan(obj) or math.isinf(obj)) else obj
-    if isinstance(obj, dict): return {k: clean_val(v) for k, v in obj.items()}
-    if isinstance(obj, list): return [clean_val(i) for i in obj]
+    if isinstance(obj, dict): return {k: clean_nan(v) for k, v in obj.items()}
+    if isinstance(obj, list): return [clean_nan(i) for i in obj]
     return obj
 
 @app.route("/health")
 def health():
     return jsonify({"status": "ok", "time": datetime.now(timezone.utc).isoformat(),
-        "version": bot_state["version"], "market_open": bot_state["market_open"],
+        "version": bot_state["version"], "regime": bot_state["market_regime"],
         "positions": len(bot_state["positions"]), "symbols": len(SYMBOLS)})
 
 @app.route("/status")
 def status():
-    get_account_info(); wins = bot_state["win_count"]; total = bot_state["total_trades"]
-    return jsonify(clean_val({"running": bot_state["running"], "killed": bot_state["killed"],
-        "paper_mode": PAPER_MODE, "version": bot_state["version"],
-        "market_open": bot_state["market_open"], "in_trading_window": bot_state["in_trading_window"],
+    refresh_account(); wins = bot_state["win_count"]; total = bot_state["total_trades"]
+    return jsonify(clean_nan({
+        "running": bot_state["running"], "killed": bot_state["killed"],
         "positions": bot_state["positions"], "strategy_positions": bot_state["strategy_positions"],
         "closed_trades": bot_state["closed_trades"][-50:], "diary": bot_state["diary"][-100:],
         "day_pnl": bot_state["day_pnl"], "total_trades": total,
         "win_rate": round(wins/total*100) if total > 0 else 0,
-        "strategy_stats": bot_state["strategy_stats"],
-        "long_stats": bot_state["long_stats"], "short_stats": bot_state["short_stats"],
-        "signals": bot_state["signals"],
-        "account_balance": bot_state["account_balance"], "account_equity": bot_state["account_equity"],
-        "account_nav": bot_state["account_nav"], "market_regime": bot_state["market_regime"],
-        "active_cooldowns": bot_state["active_cooldowns"], "daily_paused": bot_state["daily_paused"]}))
+        "strategy_stats": bot_state["strategy_stats"], "signals": bot_state["signals"],
+        "account_cash": bot_state["account_cash"], "account_equity": bot_state["account_equity"],
+        "market_regime": bot_state["market_regime"], "symbol_regimes": bot_state["symbol_regimes"],
+        "active_cooldowns": bot_state["active_cooldowns"],
+        "pending_confirmations": len(bot_state["pending_confirmation"]),
+        "daily_paused": bot_state["daily_paused"], "version": bot_state["version"]}))
 
 @app.route("/diary")
 def diary():
@@ -871,15 +830,9 @@ def kill():
     return jsonify({"killed": bot_state["killed"]})
 
 @app.route("/bars")
-def bars_route():
-    symbol = request.args.get("symbol", "EUR_USD"); tf = request.args.get("timeframe", "M5")
-    candles = get_candles(symbol, tf, 150); result = []
-    for c in candles:
-        try:
-            t = int(datetime.fromisoformat(c["time"].replace("Z","+00:00")).timestamp())
-            result.append({"time": t, "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"]})
-        except: pass
-    return jsonify(result)
+def bars():
+    symbol = request.args.get("symbol", "BTC/USD"); tf = request.args.get("timeframe", "5Min")
+    data = get_bars(symbol, tf, 150); return jsonify(clean_nan(data))
 
 @app.route("/history")
 def history():
@@ -887,11 +840,21 @@ def history():
     if sf: trades = [t for t in trades if t.get("strategy") == sf]
     return jsonify({"trades": trades})
 
+@app.route("/stats")
+def stats():
+    return jsonify(clean_nan({"overall": {"total_trades": bot_state["total_trades"],
+        "win_rate": round(bot_state["win_count"]/bot_state["total_trades"]*100) if bot_state["total_trades"] > 0 else 0,
+        "day_pnl": bot_state["day_pnl"]},
+        "by_strategy": {s: {"trades": bot_state["strategy_stats"][s]["trades"],
+            "wins": bot_state["strategy_stats"][s]["wins"],
+            "win_rate": round(bot_state["strategy_stats"][s]["wins"]/bot_state["strategy_stats"][s]["trades"]*100) if bot_state["strategy_stats"][s]["trades"] > 0 else 0,
+            "pnl": bot_state["strategy_stats"][s]["pnl"]} for s in STRATEGIES}}))
+
 @app.route("/")
 def index():
     try:
         with open("index.html") as f: return f.read()
-    except: return jsonify({"status": "ForexAI v7.0", "symbols": SYMBOLS})
+    except: return jsonify({"status": "Combined Crypto v2.0", "symbols": [s for s in SYMBOLS]})
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080)); app.run(host="0.0.0.0", port=port)
