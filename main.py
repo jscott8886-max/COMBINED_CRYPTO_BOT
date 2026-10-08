@@ -1,8 +1,9 @@
-# ScalpAI Combined Crypto Bot - v4.1
+# ScalpAI Combined Crypto Bot - v5.2
 # 5 Strategies: EMA + MSS + VPA + Breakout + WeekendGap
-# 8 Coins: BTC ETH SOL XRP DOGE LINK LTC ADA (AVAX+UNI removed)
-# VPA DISABLED in bear regime | 60min time exit
+# 7 Coins: BTC ETH SOL XRP DOGE LINK LTC (AVAX+UNI+ADA removed)
+# VPA DISABLED in bear regime | 60min time exit | 2% regime buffer | ADX filter
 # 2hr VPA cooldown | 3-loss 6hr lockout | EMA+MSS priority
+# ADA cut 2026-08-19: 11W/87L, -$1,055 — chronic chop near 200 EMA buffer
 import os, time, logging, math
 from datetime import datetime, timezone, timedelta
 from flask import Flask, jsonify, request
@@ -25,7 +26,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 
 SYMBOLS = ["BTC/USD", "ETH/USD", "SOL/USD", "XRP/USD", "DOGE/USD",
-           "LINK/USD", "LTC/USD", "ADA/USD"]  # AVAX + UNI removed — 0% win rate across 2 weeks
+           "LINK/USD", "LTC/USD"]  # AVAX + UNI removed (0% WR) — ADA removed (11W/87L, -$1,055 — chop near 200 EMA buffer)
 STRATEGIES = ["EMA", "MSS", "VPA", "Breakout", "Gap"]
 
 EMA_CONFIG = {
@@ -98,7 +99,7 @@ bot_state = {
     "prev_week_closes": {},  # For weekend gap detection
     "gap_fired_this_week": {},
     "loss_streak": 0,
-    "version": "Combined-5.1"
+    "version": "Combined-5.2"
 }
 
 # ── Alpaca helpers ─────────────────────────────────────────────────────
@@ -721,8 +722,8 @@ def trading_loop():
         "VPA DISABLED in bear regime | NO_SUPPLY standalone removed | "
         "VPA 2hr cooldown | 60min time exit | "
         "3-loss 6hr lockout | EMA+MSS priority over VPA", "system")
-    log.info("Combined Crypto Bot v5.1 started")
-    send_telegram("🚀 <b>Crypto Bot v5.1 started</b>\n8 coins | ADX filter | 2% regime buffer")
+    log.info("Combined Crypto Bot v5.2 started")
+    send_telegram("🚀 <b>Crypto Bot v5.2 started</b>\n7 coins (ADA cut) | ADX filter | 2% regime buffer")
 
     regime_check_time = None; daily_reset_date = None
     while True:
